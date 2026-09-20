@@ -53,4 +53,9 @@ export const AGENT_LOGOS = [
     nameKey: "provider.display.omo",
     provider: "omo",
   },
+  {
+    id: 40,
+    nameKey: "provider.display.cline",
+    provider: "cline",
+  },
 ];

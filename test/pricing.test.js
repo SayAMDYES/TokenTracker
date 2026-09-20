@@ -1175,6 +1175,25 @@ test("index: computeRowCost prefers a provider-reported Grok cost", () => {
   assert.equal(cost, 0.130486);
 });
 
+test("index: Cline reported cost is authoritative and reasoning is a subset", () => {
+  const row = {
+    source: "cline",
+    model: "claude-sonnet-4-6",
+    input_tokens: 8_000,
+    cached_input_tokens: 2_000,
+    cache_creation_input_tokens: 0,
+    output_tokens: 1_000,
+    reasoning_output_tokens: 400,
+    total_cost_usd: 0.25,
+  };
+  assert.equal(pricing.computeRowCost(row), 0.25);
+  const estimated = pricing.computeRowCost({ ...row, total_cost_usd: 0 });
+  assert.equal(
+    estimated,
+    pricing.computeRowCost({ ...row, total_cost_usd: 0, reasoning_output_tokens: 0 }),
+  );
+});
+
 test("index: computeRowCost ignores reported costs from non-authoritative sources", () => {
   const row = {
     source: "command-code",

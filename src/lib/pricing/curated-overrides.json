@@ -6,6 +6,13 @@
     "iflytek_maas_pricing_note": "iFlytek MaaS inference prices supplied for AStudio on 2026-08-31. AStudio homepage: https://agent.xfyun.cn/. Official pricing source: https://maas.xfyun.cn/modelSquare. Source values are RMB per million tokens, converted at 7.2 RMB/USD, then rounded to two decimal places for billing. Models without a dedicated cache-hit price use the normal input rate; cache writes also use the normal input rate. iFlytek MaaS prices are source-scoped and do not inherit DeepSeek time-of-use discounts."
   },
   "exact": {
+    "cline-gateway-models": {
+      "input": 0,
+      "output": 0,
+      "cache_read": 0,
+      "cache_write": 0,
+      "note": "Cline's own gateway namespaces (`cline-free/*` free tier, `cline-pass/*` flat-rate Cline Pass). Cline's shipped model catalog declares pricing 0 for every id in both namespaces, so a turn there has no marginal per-token cost — same convention as PI_SUBSCRIPTION_SOURCES. The fuzzy entries at the top of `fuzzy` route both prefixes here BEFORE the model names can match a public rate (`cline-pass/glm-5.3` must not bill GLM-5.3 list price, `cline-free/deepseek-v4.1-flash` must not bill DeepSeek). Verified against Cline 0.0.32 (/Applications/Cline.app model catalog + `usageDelta` cost, which stays 0 for both namespaces). A Cline turn that DOES report a positive per-call cost is honoured first because `cline` is listed in SOURCES_WITH_AUTHORITATIVE_COST in pricing/index.js. Remove or re-point these entries when Cline publishes per-token pricing for either namespace."
+    },
     "claude-fable-5": {
       "input": 10,
       "output": 50,
@@ -502,6 +509,14 @@
     }
   },
   "fuzzy": [
+    {
+      "match": "cline-free/",
+      "ref": "cline-gateway-models"
+    },
+    {
+      "match": "cline-pass/",
+      "ref": "cline-gateway-models"
+    },
     {
       "match": "gpt-6-astra",
       "ref": "gpt-6-astra"

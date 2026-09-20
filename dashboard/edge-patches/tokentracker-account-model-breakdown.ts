@@ -4,7 +4,7 @@
  */
 import { createClient } from "npm:@insforge/sdk";
 
-const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok"]);
+const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok", "cline"]);
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -379,6 +379,14 @@ function getModelPricing(model: string, source = "") {
   const exact = MODEL_PRICING[model];
   if (exact) return exact;
   const lower = model.toLowerCase();
+  // Cline's own gateway namespaces (`cline-free/*` free tier, `cline-pass/*`
+  // flat-rate Cline Pass) bill nothing per token, and the model id after the
+  // slash must not inherit a public rate — cline-pass/glm-5.3 is not GLM-5.3
+  // list price. Matched before every model-name matcher, mirroring the
+  // curated-overrides.json `cline-gateway-models` fuzzy entries; a turn that
+  // reports its own positive cost still wins earlier via
+  // SOURCES_WITH_AUTHORITATIVE_COST.
+  if (lower.includes("cline-free/") || lower.includes("cline-pass/")) return ZERO_PRICING;
   if (lower.includes("fable")) return MODEL_PRICING["claude-fable-5"];
   // Opus 5 fast mode bills at 2x the standard Opus tier ($10/$50), so the
   // -fast matcher must precede both the opus-5 and the generic opus fallback.
@@ -764,7 +772,8 @@ export default async function (req: Request): Promise<Response> {
     const subscriptionBacked =
       src === "pi-github-copilot" || src === "pi-copilot" || src === "lmstudio";
     const reasoningIncludedInOutput =
-      src === "codex" || src === "acode" || src === "every-code";
+      src === "codex" || src === "acode" || src === "every-code" ||
+      src === "omo" || src === "cline";
     const reportedCost = Number(row.total_cost_usd);
     ma.totalCostUsd += subscriptionBacked
       ? 0

@@ -72,6 +72,7 @@ const {
   resolveReasonixTelemetryFiles,
   resolveKilocodeTaskFiles,
   resolveRoocodeTaskFiles,
+  resolveClineSessionFiles,
   resolveZedDbPath,
   resolveLmstudioHome,
   resolveLmstudioLogFiles,
@@ -684,6 +685,12 @@ async function cmdStatus(argv = []) {
   const roocodeTaskFiles = resolveRoocodeTaskFiles(process.env);
   const roocodeInstalled = roocodeTaskFiles.length > 0;
 
+  // Cline CLI v3 / desktop app — passive scan of
+  // <home>/data/sessions/*/<session>.messages.json (Cline's own data dir, not
+  // the VS Code globalStorage the Roo/Kilo forks still use).
+  const clineSessionFiles = resolveClineSessionFiles(process.env);
+  const clineInstalled = clineSessionFiles.length > 0;
+
   // Zed Agent — passive read of threads.db across all model providers
   // (hosted "zed.dev" and bring-your-own alike). threadTotals tracks one entry
   // per thread we've surfaced usage for, so its size distinguishes "DB present
@@ -1228,6 +1235,9 @@ async function cmdStatus(argv = []) {
         : null,
       roocodeInstalled
         ? `- Roo Code (VS Code extension): passive reader (${roocodeTaskFiles.length} task${roocodeTaskFiles.length !== 1 ? "s" : ""} across ${new Set(roocodeTaskFiles.map((t) => t.ide)).size} IDE${new Set(roocodeTaskFiles.map((t) => t.ide)).size !== 1 ? "s" : ""})`
+        : null,
+      clineInstalled
+        ? `- Cline: passive reader (${clineSessionFiles.length} session${clineSessionFiles.length !== 1 ? "s" : ""} in ${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size} data dir${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size !== 1 ? "s" : ""})`
         : null,
       zedInstalled
         ? `- Zed Agent: passive reader (threads.db, all providers${

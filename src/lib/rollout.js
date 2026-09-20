@@ -4647,6 +4647,14 @@ function toNonNegativeInt(v) {
   return Math.floor(n);
 }
 
+// Cost values are fractional dollars, so unlike toNonNegativeInt this keeps
+// the decimals instead of flooring to whole units.
+function toNonNegativeNumber(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
+}
+
 function firstPresentNonNegativeInt(values) {
   for (const value of values) {
     if (value !== undefined && value !== null) {
@@ -11486,6 +11494,382 @@ async function parseRoocodeIncremental({
   hourlyState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
   cursors.roocode = { ...roocodeState, seenIds: cappedSeen, fileOffsets, updatedAt };
+
+  return { recordsProcessed, eventsAggregated, bucketsQueued };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cline (Cline CLI v3 / desktop app — ~/.cline)
+//
+// Cline outgrew its VS Code extension home. The standalone CLI and desktop app
+// keep sessions in Cline's own data dir instead of the extension's
+// `globalStorage/saoudrizwan.claude-dev/tasks/<id>/ui_messages.json` layout
+// that Roo Code and Kilo Code still fork and that we only read from IDE
+// globalStorage:
+//
+//   <clineDir>/data/sessions/<session_id>/<session_id>.json           metadata
+//   <clineDir>/data/sessions/<session_id>/<session_id>.messages.json  turns
+//
+// The messages file is `{ version, updated_at, agent, sessionId, origin,
+// messages[], system_prompt }`. Each assistant turn carries:
+//
+//   ts:        epoch ms
+//   modelInfo: { id, provider, family? }
+//   metrics:   { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+//                reasoningTokenCount?, cost? }
+//
+// TOKEN SEMANTICS — why no field can be copied 1:1. Cline fills `metrics` with
+// `usageDelta()`, which diffs AI SDK LanguageModelUsage totals, and those totals
+// are INCLUSIVE:
+//
+//   inputTokens  = noCache + cacheRead + cacheWrite
+//   outputTokens = text    + reasoning
+//
+// Cline's own legacy adapter spells out the input side —
+// `tokensIn: inputTokens - cacheRead - cacheWrite` — so storing inputTokens as
+// input_tokens while also storing cacheReadTokens as cached_input_tokens would
+// bill the cached prefix twice (the Codex/every-code inflation CLAUDE.md warns
+// about). Both cache buckets are subtracted here, and because reasoning sits
+// inside outputTokens it is reported as a SUBSET: `pricing/index.js` lists
+// `cline` in reasoningIncludedInOutput so it is never billed a second time.
+//
+// COUNTING MODEL. `metrics` is attached once, when the model call finishes
+// (`usageDelta(usageBeforeModel, this.state.usage)` runs after the call), so a
+// turn is either metrics-less — not counted, picked up by a later sync — or
+// final. We still keep last-emitted totals per message and emit the positive
+// difference: re-reading an unchanged file emits nothing, and if Cline ever
+// back-fills a larger total onto a message we already counted, only the
+// increase is added. The cap below mirrors the Roo/Kilo `seenIds` bound; the
+// per-file mtime gate is what keeps the common re-read free.
+// ────────────────────────────────────────────────────────────────────────────
+
+const CLINE_MESSAGES_SUFFIX = ".messages.json";
+const MAX_CLINE_MESSAGE_TOTALS = 50_000;
+
+// Cline's own resolution chain, each step overridable ahead of it so a snapshot
+// can be pinned without touching the tool's environment:
+//   CLINE_DIR              -> <clineDir>     (default ~/.cline)
+//   CLINE_DATA_DIR         -> <dataDir>      (default <clineDir>/data)
+//   CLINE_SESSION_DATA_DIR -> <sessionsDir>  (default <dataDir>/sessions)
+function resolveClineSessionsDir(env = process.env, deps = {}) {
+  const expand = deps.expandHomePath || expandHomePath;
+  const nonEmpty = (value) => (typeof value === "string" && value.trim() ? value.trim() : null);
+
+  const sessionsOverride =
+    nonEmpty(env.TOKENTRACKER_CLINE_SESSIONS_DIR) || nonEmpty(env.CLINE_SESSION_DATA_DIR);
+  if (sessionsOverride) return expand(sessionsOverride, env);
+
+  const dataDir = nonEmpty(env.TOKENTRACKER_CLINE_DATA_DIR) || nonEmpty(env.CLINE_DATA_DIR);
+  if (dataDir) return path.join(expand(dataDir, env), "sessions");
+
+  const home = env.HOME || require("node:os").homedir();
+  const clineDir = nonEmpty(env.TOKENTRACKER_CLINE_HOME) || nonEmpty(env.CLINE_DIR);
+  return path.join(clineDir ? expand(clineDir, env) : path.join(home, ".cline"), "data", "sessions");
+}
+
+// Any explicit path override means the user pointed us at one install: skip the
+// WSL probe entirely rather than unioning in a distro copy they did not ask for.
+function clineSessionsDirIsOverridden(env = process.env) {
+  return [
+    env.TOKENTRACKER_CLINE_SESSIONS_DIR,
+    env.TOKENTRACKER_CLINE_DATA_DIR,
+    env.TOKENTRACKER_CLINE_HOME,
+    env.CLINE_SESSION_DATA_DIR,
+    env.CLINE_DATA_DIR,
+    env.CLINE_DIR,
+  ].some((value) => typeof value === "string" && value.trim());
+}
+
+// The CLI/desktop app ships no native Windows build (Windows users run the VS
+// Code extension), so on Windows the only real install is inside a distro —
+// the same dual-install shape as DSH. Returns the sessions dirs to scan,
+// native first.
+function resolveClineSessionsDirs(env = process.env, deps = {}) {
+  const platform = deps.platform || process.platform;
+  const nativeDir = deps.nativeDir || resolveClineSessionsDir(env, deps);
+  const single = (value) => (value ? [value] : []);
+  if (clineSessionsDirIsOverridden(env) || platform !== "win32") return single(nativeDir);
+
+  const existsSync = deps.existsSync || fssync.existsSync;
+  let nativeValue = null;
+  try {
+    if (nativeDir && existsSync(nativeDir)) nativeValue = nativeDir;
+  } catch (_error) {
+    // A probe failure just means we cannot vouch for the native install.
+  }
+
+  const discoverWslHome = deps.discoverWslHome || wsl.discoverWslHome;
+  const wslValue = wsl.shouldProbeWsl(env)
+    ? discoverWslHome(".cline/data/sessions", { ...deps, env })
+    : null;
+  const resolved = wsl.resolveAllWin32Paths({ nativeValue, wslValue, env, platform });
+  return [...new Set([resolved.native, resolved.wsl].filter(Boolean))];
+}
+
+
+function listClineSessionFiles(sessionsDir) {
+  const out = [];
+  if (typeof sessionsDir !== "string" || !sessionsDir) return out;
+  let entries;
+  try {
+    entries = fssync.readdirSync(sessionsDir, { withFileTypes: true });
+  } catch (_error) {
+    return out;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const sessionDir = path.join(sessionsDir, entry.name);
+    let artifacts;
+    try {
+      artifacts = fssync.readdirSync(sessionDir);
+    } catch (_error) {
+      continue;
+    }
+    const transcripts = artifacts.filter((name) => name.endsWith(CLINE_MESSAGES_SUFFIX)).sort();
+    if (transcripts.length === 0) continue;
+    // The canonical transcript mirrors the session dir name
+    // (`<session_id>.messages.json`). An extra file in the same dir (an export,
+    // a renamed copy) would otherwise double-count the session, so prefer the
+    // canonical name and fall back to the first sorted one.
+    const canonical = `${entry.name}${CLINE_MESSAGES_SUFFIX}`;
+    const messagesName = transcripts.includes(canonical) ? canonical : transcripts[0];
+    const metaName = `${entry.name}.json`;
+    out.push({
+      filePath: path.join(sessionDir, messagesName),
+      sessionMetaPath: artifacts.includes(metaName) ? path.join(sessionDir, metaName) : null,
+      sessionId: entry.name,
+    });
+  }
+  return out;
+}
+
+// Every `<home>/data/sessions/*/<session>.messages.json` transcript across the
+// installs that own a Cline data dir.
+function resolveClineSessionFiles(env = process.env, deps = {}) {
+  const out = [];
+  const seen = new Set();
+  for (const sessionsDir of resolveClineSessionsDirs(env, deps)) {
+    for (const entry of listClineSessionFiles(sessionsDir)) {
+      if (seen.has(entry.filePath)) continue;
+      seen.add(entry.filePath);
+      out.push(entry);
+    }
+  }
+  out.sort((left, right) => left.filePath.localeCompare(right.filePath));
+  return out;
+}
+
+// The session sidecar names the model the session started on. It is only a
+// fallback: a turn's own `modelInfo.id` wins because Cline can switch models
+// mid-session.
+function readClineSessionModel(metaPath) {
+  if (typeof metaPath !== "string" || !metaPath) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(fssync.readFileSync(metaPath, "utf8"));
+  } catch (_error) {
+    return null;
+  }
+  const model = parsed && typeof parsed.model === "string" ? parsed.model.trim() : "";
+  return model || null;
+}
+
+function normalizeClineModel({ modelInfo, fallbackModel }) {
+  const id = modelInfo && typeof modelInfo.id === "string" ? modelInfo.id.trim() : "";
+  if (id) return id;
+  const fallback = typeof fallbackModel === "string" ? fallbackModel.trim() : "";
+  if (fallback) return fallback;
+  // Mirrors Roo Code's `protocol:<x>`: surface the provider rather than a bare
+  // "unknown" so the Model column does not imply a model id we never saw.
+  const provider =
+    modelInfo && typeof modelInfo.provider === "string"
+      ? modelInfo.provider.trim().toLowerCase().replace(/[^a-z0-9._-]/g, "")
+      : "";
+  return provider ? `provider:${provider}` : DEFAULT_MODEL;
+}
+
+function clineMessageTotalsKey(sessionId, message, index) {
+  const id = message && typeof message.id === "string" ? message.id.trim() : "";
+  // `id` is stable across in-place rewrites; ts is the fallback for a turn that
+  // has not been assigned one.
+  return `${sessionId}:${id || `ts:${Number(message?.ts) || index}`}`;
+}
+
+async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgress, env } = {}) {
+  await ensureDir(path.dirname(queuePath));
+  const clineState = cursors.cline && typeof cursors.cline === "object" ? cursors.cline : {};
+  const messageTotals =
+    clineState.messageTotals && typeof clineState.messageTotals === "object"
+      ? { ...clineState.messageTotals }
+      : {};
+  const fileOffsets =
+    clineState.fileOffsets && typeof clineState.fileOffsets === "object"
+      ? { ...clineState.fileOffsets }
+      : {};
+
+  const files = Array.isArray(sessionFiles)
+    ? sessionFiles
+    : resolveClineSessionFiles(env || process.env);
+
+  if (files.length === 0) {
+    cursors.cline = {
+      ...clineState,
+      messageTotals,
+      fileOffsets,
+      updatedAt: new Date().toISOString(),
+    };
+    return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+  }
+
+  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  const touchedBuckets = new Set();
+  const cb = typeof onProgress === "function" ? onProgress : null;
+  let recordsProcessed = 0;
+  let eventsAggregated = 0;
+
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const entry = files[fileIdx];
+    const { filePath } = entry;
+    const sessionId = entry.sessionId || path.basename(path.dirname(filePath));
+    try {
+      let stat;
+      try {
+        stat = fssync.statSync(filePath);
+      } catch (_error) {
+        continue;
+      }
+
+      const prevEntry = fileOffsets[filePath];
+      if (
+        prevEntry &&
+        Number(prevEntry.size) === stat.size &&
+        Number(prevEntry.mtimeMs) === stat.mtimeMs
+      ) {
+        continue;
+      }
+
+      let raw;
+      try {
+        raw = fssync.readFileSync(filePath, "utf8");
+      } catch (_error) {
+        continue;
+      }
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch (_error) {
+        continue;
+      }
+      const messages = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.messages)
+          ? data.messages
+          : null;
+      if (!messages) continue;
+
+      const fallbackModel = readClineSessionModel(entry.sessionMetaPath);
+
+      for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
+        const msg = messages[msgIdx];
+        if (!msg || typeof msg !== "object") continue;
+        if (msg.role !== "assistant") continue;
+        const metrics = msg.metrics;
+        if (!metrics || typeof metrics !== "object") continue;
+
+        const ts = Number(msg.ts);
+        if (!Number.isFinite(ts) || ts <= 0) continue;
+
+        // Cline's `inputTokens` already contains both cache buckets, so only the
+        // non-cached remainder is billable input. See the header comment.
+        const cacheRead = toNonNegativeInt(metrics.cacheReadTokens);
+        const cacheWrite = toNonNegativeInt(metrics.cacheWriteTokens);
+        const inclusiveInput = toNonNegativeInt(metrics.inputTokens);
+        const inputTokens = Math.max(0, inclusiveInput - cacheRead - cacheWrite);
+        // Reasoning is a subset of outputTokens; it is reported, never added to
+        // total_tokens and never billed on top of output.
+        const outputTokens = toNonNegativeInt(metrics.outputTokens);
+        const reasoningTokens = toNonNegativeInt(metrics.reasoningTokenCount);
+        const cost = toNonNegativeNumber(metrics.cost);
+        const totalTokens = inputTokens + cacheRead + cacheWrite + outputTokens;
+
+        recordsProcessed++;
+
+        const key = clineMessageTotalsKey(sessionId, msg, msgIdx);
+        const previous = messageTotals[key];
+        // A turn with no usage yet is left unrecorded so a later sync counts it
+        // in full rather than latching the placeholder.
+        if (totalTokens === 0 && reasoningTokens === 0 && cost === 0) continue;
+
+        const deltaInput = Math.max(0, inputTokens - (Number(previous?.input) || 0));
+        const deltaCached = Math.max(0, cacheRead - (Number(previous?.cached_input) || 0));
+        const deltaCreation = Math.max(0, cacheWrite - (Number(previous?.cache_creation) || 0));
+        const deltaOutput = Math.max(0, outputTokens - (Number(previous?.output) || 0));
+        const deltaReasoning = Math.max(0, reasoningTokens - (Number(previous?.reasoning) || 0));
+        const deltaCost = Math.max(0, cost - (Number(previous?.cost) || 0));
+        const deltaTotal = deltaInput + deltaCached + deltaCreation + deltaOutput;
+        if (deltaTotal === 0 && deltaReasoning === 0 && deltaCost === 0) continue;
+
+        const bucketStart = toUtcHalfHourStart(new Date(ts).toISOString());
+        if (!bucketStart) continue;
+
+        const model = normalizeClineModel({ modelInfo: msg.modelInfo, fallbackModel });
+        const bucket = getHourlyBucket(hourlyState, "cline", model, bucketStart);
+        addTotals(bucket.totals, {
+          input_tokens: deltaInput,
+          cached_input_tokens: deltaCached,
+          cache_creation_input_tokens: deltaCreation,
+          output_tokens: deltaOutput,
+          reasoning_output_tokens: deltaReasoning,
+          total_tokens: deltaTotal,
+          total_cost_usd: deltaCost,
+          conversation_count: 1,
+        });
+        touchedBuckets.add(bucketKey("cline", model, bucketStart));
+
+        messageTotals[key] = {
+          input: inputTokens,
+          cached_input: cacheRead,
+          cache_creation: cacheWrite,
+          output: outputTokens,
+          reasoning: reasoningTokens,
+          cost,
+        };
+        eventsAggregated++;
+      }
+
+      fileOffsets[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+    } finally {
+      // One tick per discovered transcript — including ones skipped as
+      // unchanged or dropped as unreadable — so the sync progress bar always
+      // reaches its total instead of stalling on the first skip.
+      if (cb) {
+        cb({
+          index: fileIdx + 1,
+          total: files.length,
+          recordsProcessed,
+          eventsAggregated,
+          bucketsQueued: touchedBuckets.size,
+        });
+      }
+    }
+  }
+
+  // Bound the map the way Roo/Kilo bound `seenIds`. Only a session file that is
+  // rewritten after its entry was pruned could be re-counted, and the oldest
+  // entries belong to the least recently touched files.
+  const totalsKeys = Object.keys(messageTotals);
+  const cappedTotals = {};
+  const keptKeys =
+    totalsKeys.length > MAX_CLINE_MESSAGE_TOTALS
+      ? totalsKeys.slice(-MAX_CLINE_MESSAGE_TOTALS)
+      : totalsKeys;
+  for (const key of keptKeys) cappedTotals[key] = messageTotals[key];
+
+  const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
+  const updatedAt = new Date().toISOString();
+  hourlyState.updatedAt = updatedAt;
+  cursors.hourly = hourlyState;
+  cursors.cline = { ...clineState, messageTotals: cappedTotals, fileOffsets, updatedAt };
 
   return { recordsProcessed, eventsAggregated, bucketsQueued };
 }
@@ -22884,6 +23268,13 @@ module.exports = {
   readRoocodeTaskModel,
   normalizeRoocodeModel,
   parseRoocodeIncremental,
+  resolveClineSessionsDir,
+  resolveClineSessionsDirs,
+  listClineSessionFiles,
+  resolveClineSessionFiles,
+  readClineSessionModel,
+  normalizeClineModel,
+  parseClineIncremental,
   resolveZedDbPath,
   decodeZedThreadBlob,
   extractZedTotals,
