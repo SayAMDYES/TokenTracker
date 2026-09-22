@@ -381,7 +381,94 @@ test("parseClineIncremental adds only the increase when Cline back-fills a count
   assert.equal(grown.cached_input_tokens, 25);
   assert.equal(grown.output_tokens, 40);
   assert.equal(grown.total_tokens, 340);
+  assert.equal(grown.conversation_count, 1, "a backfill is not a new assistant turn");
+  writeMessages(home, sessionId, [turn({
+    inputTokens: 300, outputTokens: 40, cacheReadTokens: 25, cost: 0.25,
+  })], "claude-sonnet-5");
+  await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+  const priced = lastRowForKey(queueRows(queuePath), key);
+  assert.equal(priced.conversation_count, 1, "a cost-only backfill is not a new turn");
+  assert.equal(priced.total_cost_usd, 0.25);
+  assert.equal(priced.total_tokens, 340);
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("Cline retains a recently backfilled turn when the message ledger reaches its cap", async () => {
+  const home = setupFixture({ sessions: [] });
+  try {
+    const sessionId = "fixture-cap";
+    const message = (id, inputTokens) => ({
+      id, role: "assistant", ts: Date.UTC(2026, 8, 19, 18, 40),
+      modelInfo: { id: "fixture-model" }, metrics: { inputTokens, outputTokens: 10 },
+    });
+    writeMessages(home, sessionId, [message("old", 100)]);
+    const queuePath = path.join(home, "queue.jsonl");
+    const files = resolveClineSessionFiles(fakeEnv(home));
+    let cursors = {};
+    await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
+    // Synthetic retained records fill the ledger; the real parsed turn is its oldest key.
+    for (let i = 0; i < 49_999; i++) {
+      cursors.cline.messageTotals[`fixture-retained:${i}`] = { input: 1 };
+    }
+    writeMessages(home, sessionId, [message("old", 200), message("new", 50)]);
+    await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
+    assert.equal(Object.keys(cursors.cline.messageTotals).length, 50_000);
+    assert.equal(cursors.cline.messageTotals[`${sessionId}:old`]?.input, 200);
+    assert.equal(cursors.cline.messageTotals["fixture-retained:0"], undefined);
+
+    cursors = JSON.parse(JSON.stringify(cursors));
+    writeMessages(home, sessionId, [message("old", 200), message("new", 50), message("next", 30)]);
+    const result = await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
+    assert.equal(result.eventsAggregated, 1);
+    const row = queueRows(queuePath).at(-1);
+    assert.equal(row.total_tokens, 310);
+    assert.equal(row.conversation_count, 3);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Cline reads the checked file even if its path is replaced, then detects the replacement", async (t) => {
+  const home = setupFixture({ sessions: [] });
+  try {
+    const sessionId = "fixture-race";
+    const message = (id, inputTokens) => ({
+      id, role: "assistant", ts: Date.UTC(2026, 8, 19, 18, 40),
+      modelInfo: { id: "fixture-model" }, metrics: { inputTokens, outputTokens: 10 },
+    });
+    writeMessages(home, sessionId, [message("old", 100)]);
+    const files = resolveClineSessionFiles(fakeEnv(home));
+    const filePath = files[0].filePath;
+    const fixedTime = new Date("2026-09-19T19:00:00Z");
+    fs.utimesSync(filePath, fixedTime, fixedTime);
+    const read = fs.readFileSync;
+    let replaced = false;
+    let readDescriptor;
+    t.mock.method(fs, "readFileSync", (target, ...args) => {
+      if (!replaced && (typeof target === "number" || target === filePath)) {
+        replaced = true;
+        readDescriptor = target;
+        fs.renameSync(filePath, `${filePath}.old`);
+        writeMessages(home, sessionId, [message("new", 200)]);
+        // Equal size and mtime make inode identity necessary on the next sync.
+        fs.utimesSync(filePath, fixedTime, fixedTime);
+      }
+      return read(target, ...args);
+    });
+    const cursors = {};
+    const queuePath = path.join(home, "queue.jsonl");
+    await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
+    assert.equal(queueRows(queuePath).at(-1).total_tokens, 110);
+    assert.equal(typeof readDescriptor, "number");
+    assert.throws(() => fs.fstatSync(readDescriptor), { code: "EBADF" });
+    await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
+    assert.equal(queueRows(queuePath).at(-1).total_tokens, 320);
+    const idle = await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
+    assert.equal(idle.recordsProcessed, 0);
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("parseClineIncremental skips turns without usage and counts them once they arrive", async () => {
@@ -459,4 +546,47 @@ test("parseClineIncremental reports progress and tolerates unreadable transcript
     [1, 2],
   );
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("Cline closes transcript descriptors on unchanged, malformed and failed reads", async (t) => {
+  for (const scenario of ["unchanged", "malformed", "read-error"]) {
+    await t.test(scenario, async (t) => {
+      const home = setupFixture({ sessions: [{ id: "fixture-close", messages: [] }] });
+      try {
+        const sessionFiles = resolveClineSessionFiles(fakeEnv(home));
+        const filePath = sessionFiles[0].filePath;
+        const cursors = {};
+        const queuePath = path.join(home, "queue.jsonl");
+        if (scenario === "unchanged") {
+          await parseClineIncremental({ sessionFiles, cursors, queuePath });
+        } else if (scenario === "malformed") {
+          fs.writeFileSync(filePath, "{incomplete");
+        }
+        const open = fs.openSync;
+        const read = fs.readFileSync;
+        let descriptor;
+        t.mock.method(fs, "openSync", (target, ...args) => {
+          const fd = open(target, ...args);
+          if (target === filePath) descriptor = fd;
+          return fd;
+        });
+        t.mock.method(fs, "readFileSync", (target, ...args) => {
+          if (target === descriptor && scenario === "read-error") {
+            throw Object.assign(new Error("synthetic transcript read failure"), { code: "EIO" });
+          }
+          return read(target, ...args);
+        });
+        const result = await parseClineIncremental({ sessionFiles, cursors, queuePath });
+        assert.equal(result.eventsAggregated, 0);
+        assert.equal(typeof descriptor, "number");
+        assert.throws(() => fs.fstatSync(descriptor), { code: "EBADF" });
+        if (scenario !== "unchanged") {
+          assert.equal(cursors.cline.fileOffsets[filePath], undefined);
+        }
+      } finally {
+        t.mock.restoreAll();
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
 });

@@ -11733,26 +11733,27 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
     const sessionId = entry.sessionId || path.basename(path.dirname(filePath));
     try {
       let stat;
-      try {
-        stat = fssync.statSync(filePath);
-      } catch (_error) {
-        continue;
-      }
-
-      const prevEntry = fileOffsets[filePath];
-      if (
-        prevEntry &&
-        Number(prevEntry.size) === stat.size &&
-        Number(prevEntry.mtimeMs) === stat.mtimeMs
-      ) {
-        continue;
-      }
-
       let raw;
+      let fd;
       try {
-        raw = fssync.readFileSync(filePath, "utf8");
+        // Check and read the same open file even if Cline replaces its path.
+        fd = fssync.openSync(filePath, "r");
+        stat = fssync.fstatSync(fd);
+        if (!stat.isFile()) continue;
+        const prevEntry = fileOffsets[filePath];
+        if (
+          prevEntry &&
+          Number(prevEntry.size) === stat.size &&
+          Number(prevEntry.mtimeMs) === stat.mtimeMs &&
+          Number(prevEntry.ino) === stat.ino
+        ) {
+          continue;
+        }
+        raw = fssync.readFileSync(fd, "utf8");
       } catch (_error) {
         continue;
+      } finally {
+        if (fd !== undefined) fssync.closeSync(fd);
       }
       let data;
       try {
@@ -11822,10 +11823,12 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
           reasoning_output_tokens: deltaReasoning,
           total_tokens: deltaTotal,
           total_cost_usd: deltaCost,
-          conversation_count: 1,
+          conversation_count: previous ? 0 : 1,
         });
         touchedBuckets.add(bucketKey("cline", model, bucketStart));
 
+        // Refresh update order so backfilled turns survive bounded eviction.
+        delete messageTotals[key];
         messageTotals[key] = {
           input: inputTokens,
           cached_input: cacheRead,
@@ -11854,9 +11857,8 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
     }
   }
 
-  // Bound the map the way Roo/Kilo bound `seenIds`. Only a session file that is
-  // rewritten after its entry was pruned could be re-counted, and the oldest
-  // entries belong to the least recently touched files.
+  // Keep the most recently updated message totals. Rewriting a transcript
+  // whose entries were already evicted can still re-count those older turns.
   const totalsKeys = Object.keys(messageTotals);
   const cappedTotals = {};
   const keptKeys =

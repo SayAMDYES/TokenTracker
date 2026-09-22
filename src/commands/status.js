@@ -1237,7 +1237,7 @@ async function cmdStatus(argv = []) {
         ? `- Roo Code (VS Code extension): passive reader (${roocodeTaskFiles.length} task${roocodeTaskFiles.length !== 1 ? "s" : ""} across ${new Set(roocodeTaskFiles.map((t) => t.ide)).size} IDE${new Set(roocodeTaskFiles.map((t) => t.ide)).size !== 1 ? "s" : ""})`
         : null,
       clineInstalled
-        ? `- Cline: passive reader (${clineSessionFiles.length} session${clineSessionFiles.length !== 1 ? "s" : ""} in ${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size} data dir${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size !== 1 ? "s" : ""})`
+        ? `- Cline: passive reader (${clineSessionFiles.length} session${clineSessionFiles.length !== 1 ? "s" : ""} in ${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size} sessions dir${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size !== 1 ? "s" : ""})`
         : null,
       zedInstalled
         ? `- Zed Agent: passive reader (threads.db, all providers${
