@@ -471,6 +471,100 @@ test("Cline reads the checked file even if its path is replaced, then detects th
   }
 });
 
+test("Cline preserves precise file identity across serialized syncs", async (t) => {
+  for (const changedField of ["ino", "dev", "mtimeNs"]) {
+    await t.test(changedField, async (t) => {
+      const home = setupFixture({ sessions: [] });
+      try {
+        const sessionId = "fixture-precise";
+        const turn = (inputTokens, cost) => ({
+          id: "fixture-message", role: "assistant", ts: Date.UTC(2026, 8, 19, 18, 40),
+          modelInfo: { id: "fixture-model" }, metrics: { inputTokens, outputTokens: 10, cost },
+        });
+        writeMessages(home, sessionId, [turn(100, 0.1)]);
+        const sessionFiles = resolveClineSessionFiles(fakeEnv(home));
+        const filePath = sessionFiles[0].filePath;
+        const queuePath = path.join(home, "queue.jsonl");
+        // Synthetic filesystem metadata: distinct values collide as JavaScript numbers.
+        const metadata = { ino: 2n ** 55n, dev: 2n ** 55n, mtimeNs: 1_789_832_750_000_000_000n };
+        assert.equal(Number(metadata[changedField]), Number(metadata[changedField] + 1n));
+        const fstat = fs.fstatSync;
+        t.mock.method(fs, "fstatSync", (fd, options) => {
+          const stat = fstat(fd, options);
+          if (options?.bigint) {
+            Object.assign(stat, metadata, { mtimeMs: metadata.mtimeNs / 1_000_000n });
+          } else {
+            Object.assign(stat, {
+              ino: Number(metadata.ino), dev: Number(metadata.dev),
+              mtimeMs: Number(metadata.mtimeNs) / 1_000_000,
+            });
+          }
+          return stat;
+        });
+        let cursors = {};
+        await parseClineIncremental({ sessionFiles, cursors, queuePath });
+        cursors = JSON.parse(JSON.stringify(cursors));
+        metadata[changedField] += 1n;
+        writeMessages(home, sessionId, [turn(200, 0.2)]);
+        const changed = await parseClineIncremental({ sessionFiles, cursors, queuePath });
+        assert.equal(changed.eventsAggregated, 1, `${changedField} change must trigger a read`);
+        const row = queueRows(queuePath).at(-1);
+        assert.equal(row.total_tokens, 210);
+        assert.equal(row.total_cost_usd, 0.2);
+        assert.equal(row.conversation_count, 1);
+        const offset = cursors.cline.fileOffsets[filePath];
+        for (const key of ["size", "ino", "dev", "mtimeNs"]) {
+          assert.equal(typeof offset[key], "string");
+        }
+        assert.equal(offset[changedField], metadata[changedField].toString());
+        cursors = JSON.parse(JSON.stringify(cursors));
+        const before = queueRows(queuePath).length;
+        const idle = await parseClineIncremental({ sessionFiles, cursors, queuePath });
+        assert.equal(idle.recordsProcessed, 0);
+        assert.equal(queueRows(queuePath).length, before);
+      } finally {
+        t.mock.restoreAll();
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Cline upgrades numeric file cursors without replaying counted usage", async () => {
+  const home = setupFixture({ sessions: [] });
+  try {
+    const sessionId = "fixture-legacy";
+    writeMessages(home, sessionId, [{
+      id: "fixture-message", role: "assistant", ts: Date.UTC(2026, 8, 19, 18, 40),
+      modelInfo: { id: "fixture-model" }, metrics: { inputTokens: 100, outputTokens: 10 },
+    }]);
+    const sessionFiles = resolveClineSessionFiles(fakeEnv(home));
+    const filePath = sessionFiles[0].filePath;
+    const queuePath = path.join(home, "queue.jsonl");
+    let cursors = {};
+    await parseClineIncremental({ sessionFiles, cursors, queuePath });
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const stat = fs.fstatSync(fd);
+      cursors.cline.fileOffsets[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+    } finally {
+      fs.closeSync(fd);
+    }
+    cursors = JSON.parse(JSON.stringify(cursors));
+    const before = queueRows(queuePath).length;
+    const upgraded = await parseClineIncremental({ sessionFiles, cursors, queuePath });
+    assert.equal(upgraded.recordsProcessed, 1, "old file metadata is rechecked once");
+    assert.equal(upgraded.eventsAggregated, 0, "retained message totals prevent replay");
+    assert.equal(queueRows(queuePath).length, before);
+    assert.equal(typeof cursors.cline.fileOffsets[filePath].mtimeNs, "string");
+    cursors = JSON.parse(JSON.stringify(cursors));
+    const idle = await parseClineIncremental({ sessionFiles, cursors, queuePath });
+    assert.equal(idle.recordsProcessed, 0);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("parseClineIncremental skips turns without usage and counts them once they arrive", async () => {
   const ts = Date.UTC(2026, 8, 19, 19, 10, 0);
   const home = setupFixture({ sessions: [] });

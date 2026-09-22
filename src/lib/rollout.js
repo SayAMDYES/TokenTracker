@@ -11738,14 +11738,15 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
       try {
         // Check and read the same open file even if Cline replaces its path.
         fd = fssync.openSync(filePath, "r");
-        stat = fssync.fstatSync(fd);
+        stat = fssync.fstatSync(fd, { bigint: true });
         if (!stat.isFile()) continue;
         const prevEntry = fileOffsets[filePath];
         if (
           prevEntry &&
-          Number(prevEntry.size) === stat.size &&
-          Number(prevEntry.mtimeMs) === stat.mtimeMs &&
-          Number(prevEntry.ino) === stat.ino
+          prevEntry.size === stat.size.toString() &&
+          prevEntry.mtimeNs === stat.mtimeNs.toString() &&
+          prevEntry.dev === stat.dev.toString() &&
+          prevEntry.ino === stat.ino.toString()
         ) {
           continue;
         }
@@ -11840,7 +11841,13 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
         eventsAggregated++;
       }
 
-      fileOffsets[filePath] = { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+      // Strings retain large file IDs and nanosecond times through cursor JSON.
+      fileOffsets[filePath] = {
+        size: stat.size.toString(),
+        mtimeNs: stat.mtimeNs.toString(),
+        dev: stat.dev.toString(),
+        ino: stat.ino.toString(),
+      };
     } finally {
       // One tick per discovered transcript — including ones skipped as
       // unchanged or dropped as unreadable — so the sync progress bar always
