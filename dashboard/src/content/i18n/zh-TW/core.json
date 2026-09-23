@@ -45,6 +45,7 @@
   "shared.unit.thousand_abbrev": "K",
   "shared.unit.million_abbrev": "M",
   "shared.unit.billion_abbrev": "B",
+  "shared.unit.trillion_abbrev": "T",
   "shared.data_source": "資料來源：{{source}}",
   "shared.error.prefix": "錯誤：{{error}}",
   "shared.status.unsynced": "—",

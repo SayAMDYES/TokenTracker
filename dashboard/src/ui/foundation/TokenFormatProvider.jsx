@@ -58,6 +58,7 @@ export function TokenFormatProvider({ children }) {
       thousandSuffix: copy("shared.unit.thousand_abbrev"),
       millionSuffix: copy("shared.unit.million_abbrev"),
       billionSuffix: copy("shared.unit.billion_abbrev"),
+      trillionSuffix: copy("shared.unit.trillion_abbrev"),
     }),
     [resolvedLocale],
   );
