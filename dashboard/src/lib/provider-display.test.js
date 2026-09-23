@@ -62,6 +62,11 @@ describe("formatProviderDisplayName", () => {
     expect(formatProviderDisplayName("omo")).not.toBe(formatProviderDisplayName("omp"));
   });
 
+  it("formats minimax-code as MiniMax Code", () => {
+    expect(formatProviderDisplayName("minimax-code")).toBe("MiniMax Code");
+    expect(formatProviderDisplayName("MINIMAX-CODE")).toBe("MiniMax Code");
+  });
+
   it("uses the registered DeepSeek Harness product name for current and legacy sources", () => {
     expect(formatProviderDisplayName("dsh")).toBe("DeepSeek Harness");
     expect(formatProviderDisplayName("deepseek")).toBe("DeepSeek Harness");

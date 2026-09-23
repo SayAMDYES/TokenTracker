@@ -58,4 +58,9 @@ export const AGENT_LOGOS = [
     nameKey: "provider.display.cline",
     provider: "cline",
   },
+  {
+    id: 41,
+    nameKey: "provider.display.minimax_code",
+    provider: "minimax-code",
+  },
 ];

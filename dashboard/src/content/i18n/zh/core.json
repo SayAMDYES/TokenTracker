@@ -155,6 +155,7 @@
   "limits.provider.copilot": "GitHub Copilot",
   "provider.display.omp": "oh-my-pi",
   "provider.display.omo": "OmO",
+  "provider.display.minimax_code": "MiniMax Code",
   "provider.display.deepseek_harness": "DeepSeek Harness",
   "provider.display.cline": "Cline",
   "provider.display.trae_work_cn": "TRAE Work 中国版",

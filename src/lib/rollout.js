@@ -3465,7 +3465,7 @@ function deriveOpencodeMessageFingerprint({ msg, totals, source }) {
     totals.reasoning_output_tokens,
     model,
     provider,
-  ].join(" ");
+  ].join("\u0000");
   // Hashed rather than stored raw: the fingerprint is persisted per message in
   // cursors.json, and heavy OpenCode users carry tens of thousands of entries.
   return crypto.createHash("sha256").update(raw).digest("base64url").slice(0, 22);
@@ -15743,6 +15743,17 @@ function primeAgentSourceForProvider(provider) {
   return slug ? `prime-agent-${slug}` : "prime-agent";
 }
 
+// Maps one parsed JSONL line to { id, message, timestamp } or null. pi-family
+// files wrap each record as { type: "message", id, timestamp, message }.
+function readPiMessageEntry(entry) {
+  if (!entry || entry.type !== "message") return null;
+  return {
+    id: typeof entry.id === "string" && entry.id ? entry.id : null,
+    message: entry.message,
+    timestamp: entry.timestamp,
+  };
+}
+
 async function parsePiLikeIncremental({
   sessionFiles,
   cursors,
@@ -15756,6 +15767,7 @@ async function parsePiLikeIncremental({
   resolveSessionFiles,
   resolveDefaultModel,
   sourceForProvider,
+  readEntry = readPiMessageEntry,
 } = {}) {
   await ensureDir(path.dirname(queuePath));
   const projectEnabled = typeof projectQueuePath === "string" && projectQueuePath.length > 0;
@@ -15857,15 +15869,16 @@ async function parsePiLikeIncremental({
       let entry;
       try { entry = JSON.parse(line); } catch { continue; }
 
-      if (!entry || entry.type !== "message") continue;
+      const record = readEntry(entry);
+      if (!record) continue;
 
-      const msg = entry.message;
+      const msg = record.message;
       if (!msg || msg.role !== "assistant") continue;
 
       const usage = msg.usage;
       if (!usage || typeof usage !== "object") continue;
 
-      const entryId = typeof entry.id === "string" && entry.id ? entry.id : null;
+      const entryId = record.id;
       if (!entryId) continue;
       if (seenIds.has(entryId)) continue;
 
@@ -15891,8 +15904,8 @@ async function parsePiLikeIncremental({
       let tsMs = null;
       if (Number.isFinite(Number(msg.timestamp)) && Number(msg.timestamp) > 0) {
         tsMs = Number(msg.timestamp);
-      } else if (typeof entry.timestamp === "string" && entry.timestamp) {
-        const parsed = Date.parse(entry.timestamp);
+      } else if (typeof record.timestamp === "string" && record.timestamp) {
+        const parsed = Date.parse(record.timestamp);
         if (Number.isFinite(parsed) && parsed > 0) tsMs = parsed;
       }
       if (tsMs == null) {
@@ -16003,11 +16016,12 @@ async function parsePiLikeIncremental({
           if (!line || !line.trim()) continue;
           let entry;
           try { entry = JSON.parse(line); } catch { continue; }
-          const msg = entry?.type === "message" ? entry.message : null;
+          const record = readEntry(entry);
+          const msg = record ? record.message : null;
           const usage = msg?.role === "assistant" ? msg.usage : null;
           if (!usage || typeof usage !== "object") continue;
 
-          const entryId = typeof entry.id === "string" && entry.id ? entry.id : null;
+          const entryId = record.id;
           if (!entryId || projectSeenIds.has(entryId)) continue;
 
           const input = toNonNegativeInt(usage.input);
@@ -16029,8 +16043,8 @@ async function parsePiLikeIncremental({
           let tsMs = null;
           if (Number.isFinite(Number(msg.timestamp)) && Number(msg.timestamp) > 0) {
             tsMs = Number(msg.timestamp);
-          } else if (typeof entry.timestamp === "string" && entry.timestamp) {
-            const parsed = Date.parse(entry.timestamp);
+          } else if (typeof record.timestamp === "string" && record.timestamp) {
+            const parsed = Date.parse(record.timestamp);
             if (Number.isFinite(parsed) && parsed > 0) tsMs = parsed;
           }
           const bucketStart = tsMs == null
@@ -16127,6 +16141,85 @@ async function parsePrimeAgentIncremental(options = {}) {
     resolveSessionFiles: resolvePrimeAgentSessionFiles,
     resolveDefaultModel: resolvePrimeAgentDefaultModel,
     sourceForProvider: primeAgentSourceForProvider,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MiniMax Code (MiniMax's desktop coding agent) — passive JSONL reader
+// (~/.minimax/v2/sessions/YYYY/MM/DD/<HH-MM-SS-mmm>-session_<id>/messages.jsonl)
+//
+// Records carry pi-shaped usage (input excludes cacheRead) and a ms-epoch
+// message.timestamp, but have no type:"message" wrapper and dedupe on the
+// top-level message_id. MiniMax Code routes to many upstream models and records
+// the model per message. Its usage.cost block is always 0, so it is ignored in
+// favor of normal pricing. Migrated legacy sessions replay as model
+// "historical-transcript" with all-zero usage and are dropped by the engine's
+// zero-token guard. There is no cwd header, so no project attribution.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MINIMAX_CODE_SOURCE = "minimax-code";
+const MINIMAX_CODE_SESSION_FILE = "messages.jsonl";
+// sessions / YYYY / MM / DD / <session dir> / messages.jsonl
+const MINIMAX_CODE_MAX_SESSION_DEPTH = 5;
+
+function resolveMinimaxCodeHome(env = process.env) {
+  if (env.TOKENTRACKER_MINIMAX_HOME) return expandHomePath(env.TOKENTRACKER_MINIMAX_HOME, env);
+  const home = env.HOME || require("node:os").homedir();
+  if (process.platform === "win32") {
+    return pickWin32ProviderPath({
+      env,
+      nativeValue: path.join(home, ".minimax"),
+      wslProviderDir: ".minimax",
+    });
+  }
+  return path.join(home, ".minimax");
+}
+
+function resolveMinimaxCodeSessionsDir(env = process.env) {
+  const minimaxHome = resolveMinimaxCodeHome(env);
+  return minimaxHome ? path.join(minimaxHome, "v2", "sessions") : null;
+}
+
+function resolveMinimaxCodeSessionFiles(env = process.env) {
+  const sessionsDir = resolveMinimaxCodeSessionsDir(env);
+  if (!sessionsDir) return [];
+  const files = [];
+  const walk = (dir, depth) => {
+    let entries;
+    try { entries = fssync.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (depth < MINIMAX_CODE_MAX_SESSION_DEPTH) walk(fullPath, depth + 1);
+      } else if (entry.isFile() && entry.name === MINIMAX_CODE_SESSION_FILE && depth > 1) {
+        files.push(fullPath);
+      }
+    }
+  };
+  walk(sessionsDir, 1);
+  files.sort((a, b) => a.localeCompare(b));
+  return files;
+}
+
+function readMinimaxCodeEntry(entry) {
+  if (!entry || typeof entry !== "object" || !entry.message) return null;
+  return {
+    id: typeof entry.message_id === "string" && entry.message_id ? entry.message_id : null,
+    message: entry.message,
+    timestamp: null,
+  };
+}
+
+async function parseMinimaxCodeIncremental(options = {}) {
+  return parsePiLikeIncremental({
+    ...options,
+    // Session files have no cwd header, so project attribution is unsupported.
+    projectQueuePath: undefined,
+    stateKey: "minimaxCode",
+    resolveSessionFiles: resolveMinimaxCodeSessionFiles,
+    resolveDefaultModel: () => `${MINIMAX_CODE_SOURCE}-unknown`,
+    sourceForProvider: () => MINIMAX_CODE_SOURCE,
+    readEntry: readMinimaxCodeEntry,
   });
 }
 
@@ -23372,6 +23465,10 @@ module.exports = {
   resolvePrimeAgentSessionFiles,
   resolvePrimeAgentDefaultModel,
   parsePrimeAgentIncremental,
+  resolveMinimaxCodeHome,
+  resolveMinimaxCodeSessionsDir,
+  resolveMinimaxCodeSessionFiles,
+  parseMinimaxCodeIncremental,
   resolveCraftConfigDir,
   resolveCraftWorkspaceRoots,
   resolveCraftSessionFiles,

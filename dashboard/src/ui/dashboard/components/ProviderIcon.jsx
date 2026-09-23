@@ -390,6 +390,8 @@ const PROVIDER_ICON_MAP = {
   KIRO: KiroIcon,
   KILOCODE: KilocodeIcon,
   MINIMAX: MinimaxIcon,
+  // MiniMax Code (desktop agent) ships under the MiniMax brand mark.
+  "MINIMAX-CODE": MinimaxIcon,
   OPENCODE: OpenCodeIcon,
   OMP: OmpIcon,
   PI: PiIcon,

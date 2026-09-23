@@ -91,6 +91,8 @@ const {
   piAgentDirCollidesWithOmp,
   resolvePrimeAgentSessionFiles,
   parsePrimeAgentIncremental,
+  resolveMinimaxCodeSessionFiles,
+  parseMinimaxCodeIncremental,
   resolveCraftSessionFiles,
   parseCraftIncremental,
   resolveReasonixTelemetryFiles,
@@ -315,6 +317,7 @@ const AUTO_SYNC_SOURCES = new Set([
   "kimi-code",
   "lmstudio",
   "mimo",
+  "minimax-code",
   "omo",
   "omp",
   "opencode",
@@ -2546,6 +2549,34 @@ async function cmdSync(argv, context = {}) {
       }
     }
 
+    // ── MiniMax Code — passive ~/.minimax/v2/sessions/**/messages.jsonl usage reader ──
+    let minimaxCodeResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
+    const minimaxCodeFiles = sourceAllowed("minimax-code")
+      ? mergeBothFileSources({ resolveFiles: resolveMinimaxCodeSessionFiles, env: process.env })
+      : [];
+    if (minimaxCodeFiles.length > 0) {
+      if (progress?.enabled) {
+        progress.start(`Parsing MiniMax Code ${renderBar(0)} | buckets 0`);
+      }
+      try {
+        minimaxCodeResult = await parseMinimaxCodeIncremental({
+          sessionFiles: minimaxCodeFiles,
+          cursors,
+          queuePath,
+          env: process.env,
+          onProgress: (p) => {
+            if (!progress?.enabled) return;
+            const pct = p.total > 0 ? p.index / p.total : 1;
+            progress.update(
+              `Parsing MiniMax Code ${renderBar(pct)} ${formatNumber(p.index)}/${formatNumber(p.total)} files | buckets ${formatNumber(p.bucketsQueued)}`,
+            );
+          },
+        });
+      } catch (err) {
+        warnProviderParseFailure("MiniMax Code", err, opts);
+      }
+    }
+
     // ── Craft Agents (passive ~/.craft-agent + workspaces session.jsonl reader) ──
     let craftResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
     const craftFiles = sourceAllowed("craft")
@@ -3046,6 +3077,7 @@ async function cmdSync(argv, context = {}) {
       omoResult.recordsProcessed +
       piResult.recordsProcessed +
       primeAgentResult.recordsProcessed +
+      minimaxCodeResult.recordsProcessed +
       craftResult.recordsProcessed +
       reasonixResult.recordsProcessed +
       grokResult.recordsProcessed +
@@ -3087,6 +3119,7 @@ async function cmdSync(argv, context = {}) {
       omoResult.bucketsQueued +
       piResult.bucketsQueued +
       primeAgentResult.bucketsQueued +
+      minimaxCodeResult.bucketsQueued +
       craftResult.bucketsQueued +
       reasonixResult.bucketsQueued +
       grokResult.bucketsQueued +

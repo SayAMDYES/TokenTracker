@@ -64,6 +64,7 @@ timestamps, never prompts, responses, or source code.
 - Unsloth Studio
 - Devin CLI
 - Cline
+- MiniMax Code
 
 ## Capabilities
 - Desktop pet that reacts to real token burn, streaks, and rest
