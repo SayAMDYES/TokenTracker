@@ -25,6 +25,7 @@ const {
   resolveClineSessionsDirs,
   listClineSessionFiles,
   resolveClineSessionFiles,
+  resolveClineSessionFilesWithStatus,
   normalizeClineModel,
   parseClineIncremental,
 } = require("../src/lib/rollout");
@@ -282,6 +283,45 @@ test("Cline discovery distinguishes missing paths from failed directory reads", 
   }
 });
 
+test("Cline discovery only marks a root complete after every session directory is read", (t) => {
+  const home = setupFixture({
+    sessions: [
+      { id: "session_a", messages: [] },
+      { id: "session_b", messages: [] },
+    ],
+  });
+  const sessionsDir = path.join(home, "data", "sessions");
+  const interruptedSessionDir = path.join(sessionsDir, "session_a");
+  try {
+    const read = fs.readdirSync;
+    t.mock.method(fs, "readdirSync", (dir, ...args) => {
+      if (dir === interruptedSessionDir) {
+        throw Object.assign(new Error("session directory disappeared"), { code: "ENOENT" });
+      }
+      return read(dir, ...args);
+    });
+    const partial = resolveClineSessionFilesWithStatus(fakeEnv(home));
+    assert.equal(partial.files.length, 1);
+    assert.deepEqual(partial.completedRoots, []);
+    assert.deepEqual(partial.errors, []);
+
+    t.mock.restoreAll();
+    fs.rmSync(sessionsDir, { recursive: true, force: true });
+    const missing = resolveClineSessionFilesWithStatus(fakeEnv(home));
+    assert.deepEqual(missing.files, []);
+    assert.deepEqual(missing.completedRoots, []);
+    assert.deepEqual(missing.errors, []);
+
+    fs.mkdirSync(sessionsDir);
+    const empty = resolveClineSessionFilesWithStatus(fakeEnv(home));
+    assert.deepEqual(empty.files, []);
+    assert.deepEqual(empty.completedRoots, [sessionsDir]);
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("Cline message fallback keys include the index when timestamps are equal", async () => {
   const ts = Date.UTC(2026, 8, 19, 16, 30, 0);
   const home = setupFixture({
@@ -362,6 +402,36 @@ test("Cline migrates timestamp-only keys even when usage has not grown", async (
       assert.equal(result.eventsAggregated, 0);
     }
     assert.equal(queueRows(queuePath).at(-1).total_tokens, 100);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Cline migrates a timestamp fallback when a later rewrite assigns a message id", async () => {
+  const ts = Date.UTC(2026, 8, 19, 16, 30);
+  const home = setupFixture({ sessions: [{
+    id: "id-later", messages: [{ role: "assistant", ts, metrics: { inputTokens: 100, outputTokens: 10 } }],
+  }] });
+  try {
+    const queuePath = path.join(home, "queue.jsonl");
+    const cursors = {};
+    const files = () => resolveClineSessionFiles(fakeEnv(home));
+    await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+
+    writeMessages(home, "id-later", [{
+      id: "assigned-after-sync",
+      role: "assistant",
+      ts,
+      metrics: { inputTokens: 200, outputTokens: 20 },
+    }]);
+    const result = await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+    assert.equal(result.eventsAggregated, 1);
+    const row = queueRows(queuePath).at(-1);
+    assert.equal(row.total_tokens, 220);
+    assert.equal(row.conversation_count, 1);
+    assert.deepEqual(Object.keys(cursors.cline.messageTotalsByFile[files()[0].filePath]), [
+      "assigned-after-sync",
+    ]);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -670,6 +740,43 @@ test("Cline retains cursors when discovery temporarily omits an existing transcr
     assert.equal(queueRows(queuePath).length, 1);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Cline parser retains missing-root ledgers without a completed scan", async (t) => {
+  for (const discovery of ["automatic", "unverified-file-list"]) {
+    await t.test(discovery, async () => {
+      const home = setupFixture({ sessions: [{
+        id: "fixture-gap", messages: [{
+          id: "turn", role: "assistant", ts: Date.UTC(2026, 8, 19), metrics: { inputTokens: 100 },
+        }],
+      }] });
+      try {
+        const queuePath = path.join(home, "queue.jsonl");
+        const cursors = {};
+        const env = fakeEnv(home);
+        const sessionsDir = path.join(home, "data", "sessions");
+        const parkedDir = path.join(home, "parked-sessions");
+        await parseClineIncremental({ cursors, queuePath, env });
+        const before = JSON.parse(JSON.stringify(cursors.cline));
+        fs.renameSync(sessionsDir, parkedDir);
+        await parseClineIncremental({
+          ...(discovery === "unverified-file-list" ? { sessionFiles: [] } : {}),
+          ...(discovery === "unverified-file-list" ? { scanCompleteRoots: [] } : {}),
+          cursors, queuePath, env,
+        });
+        assert.deepEqual(cursors.cline.fileOffsets, before.fileOffsets);
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(cursors.cline.messageTotalsByFile)), before.messageTotalsByFile,
+        );
+        fs.renameSync(parkedDir, sessionsDir);
+        const resumed = await parseClineIncremental({ cursors, queuePath, env });
+        assert.equal(resumed.eventsAggregated, 0);
+        assert.equal(queueRows(queuePath).length, 1);
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
   }
 });
 

@@ -115,7 +115,7 @@ const {
   parseKilocodeIncremental,
   resolveRoocodeTaskFiles,
   parseRoocodeIncremental,
-  resolveClineSessionFiles,
+  resolveClineSessionFilesWithStatus,
   parseClineIncremental,
   resolveZedDbPath,
   parseZedIncremental,
@@ -1899,7 +1899,11 @@ async function cmdSync(argv, context = {}) {
     let clineResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
     if (sourceAllowed("cline")) {
       try {
-        const clineSessionFiles = resolveClineSessionFiles(process.env);
+        const clineScan = resolveClineSessionFilesWithStatus(process.env);
+        const clineSessionFiles = clineScan.files;
+        for (const failure of clineScan.errors) {
+          warnProviderParseFailure("Cline", failure.error, opts);
+        }
         if (progress?.enabled && clineSessionFiles.length > 0) {
           progress.start(
             `Parsing Cline ${renderBar(0)} 0/${formatNumber(clineSessionFiles.length)} transcripts | buckets 0`,
@@ -1907,6 +1911,7 @@ async function cmdSync(argv, context = {}) {
         }
         clineResult = await parseClineIncremental({
           sessionFiles: clineSessionFiles,
+          scanCompleteRoots: clineScan.completedRoots,
           cursors,
           queuePath,
           onProgress: (p) => {

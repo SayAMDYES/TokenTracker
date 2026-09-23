@@ -961,13 +961,21 @@ async function applyIntegrationSetup({
   // CLINE_DIR/CLINE_DATA_DIR/CLINE_SESSION_DATA_DIR); the VS Code extension's
   // globalStorage layout is a separate, older install we do not read.
   {
-    const { resolveClineSessionFiles } = require("../lib/rollout");
-    const sessionFiles = resolveClineSessionFiles(process.env);
+    const { resolveClineSessionFilesWithStatus } = require("../lib/rollout");
+    const clineScan = resolveClineSessionFilesWithStatus(process.env);
+    const sessionFiles = clineScan.files;
     if (sessionFiles.length > 0) {
       summary.push({
         label: "Cline",
         status: "detected",
-        detail: `Passive reader · ${sessionFiles.length} session${sessionFiles.length !== 1 ? "s" : ""}`,
+        detail: `Passive reader · ${sessionFiles.length} transcript${sessionFiles.length !== 1 ? "s" : ""}`,
+      });
+    }
+    for (const failure of clineScan.errors) {
+      summary.push({
+        label: "Cline",
+        status: "error",
+        detail: `Passive reader discovery failed · ${failure.root}: ${failure.error.code ? `${failure.error.code}: ` : ""}${failure.error.message}`,
       });
     }
   }

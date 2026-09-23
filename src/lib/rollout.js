@@ -11758,15 +11758,29 @@ function resolveClineSessionsDirs(env = process.env, deps = {}) {
 
 
 function listClineSessionFiles(sessionsDir) {
+  const result = scanClineSessionFiles(sessionsDir);
+  if (result.error) throw result.error;
+  return result.files;
+}
+
+// A root is complete only when every directory read needed to enumerate it
+// succeeds. A missing root or session directory is an incomplete scan: it may
+// be a transient filesystem or WSL gap, so callers must retain its ledger.
+function scanClineSessionFiles(sessionsDir) {
   const out = [];
-  if (typeof sessionsDir !== "string" || !sessionsDir) return out;
+  if (typeof sessionsDir !== "string" || !sessionsDir) {
+    return { files: out, complete: true, error: null };
+  }
   let entries;
   try {
     entries = fssync.readdirSync(sessionsDir, { withFileTypes: true });
   } catch (error) {
-    if (error.code === "ENOENT" || error.code === "ENOTDIR") return out;
-    throw error;
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+      return { files: out, complete: false, error: null };
+    }
+    return { files: out, complete: false, error };
   }
+  let complete = true;
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const sessionDir = path.join(sessionsDir, entry.name);
@@ -11774,8 +11788,11 @@ function listClineSessionFiles(sessionsDir) {
     try {
       artifacts = fssync.readdirSync(sessionDir);
     } catch (error) {
-      if (error.code === "ENOENT" || error.code === "ENOTDIR") continue;
-      throw error;
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+        complete = false;
+        continue;
+      }
+      return { files: out, complete: false, error };
     }
     const transcripts = artifacts.filter((name) => name.endsWith(CLINE_MESSAGES_SUFFIX)).sort();
     if (transcripts.length === 0) continue;
@@ -11788,23 +11805,34 @@ function listClineSessionFiles(sessionsDir) {
       });
     }
   }
-  return out;
+  return { files: out, complete, error: null };
 }
 
 // Every `<home>/data/sessions/*/<session>.messages.json` transcript across the
 // installs that own a Cline data dir.
 function resolveClineSessionFiles(env = process.env, deps = {}) {
+  const result = resolveClineSessionFilesWithStatus(env, deps);
+  if (result.errors.length > 0) throw result.errors[0].error;
+  return result.files;
+}
+
+function resolveClineSessionFilesWithStatus(env = process.env, deps = {}) {
   const out = [];
   const seen = new Set();
+  const completedRoots = [];
+  const errors = [];
   for (const sessionsDir of resolveClineSessionsDirs(env, deps)) {
-    for (const entry of listClineSessionFiles(sessionsDir)) {
+    const result = scanClineSessionFiles(sessionsDir);
+    for (const entry of result.files) {
       if (seen.has(entry.filePath)) continue;
       seen.add(entry.filePath);
       out.push(entry);
     }
+    if (result.error) errors.push({ root: sessionsDir, error: result.error });
+    else if (result.complete) completedRoots.push(sessionsDir);
   }
   out.sort((left, right) => left.filePath.localeCompare(right.filePath));
-  return out;
+  return { files: out, completedRoots, errors };
 }
 
 // The session sidecar names the model the session started on. It is only a
@@ -11844,7 +11872,14 @@ function clineMessageKey(message, index) {
   return id || `ts:${Number.isFinite(timestamp) ? timestamp : 0}:${index}`;
 }
 
-async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgress, env } = {}) {
+async function parseClineIncremental({
+  sessionFiles,
+  scanCompleteRoots,
+  cursors,
+  queuePath,
+  onProgress,
+  env,
+} = {}) {
   await ensureDir(path.dirname(queuePath));
   const clineState = cursors.cline && typeof cursors.cline === "object" ? { ...cursors.cline } : {};
   const legacyMessageTotals =
@@ -11860,9 +11895,15 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
       ? { ...clineState.fileOffsets }
       : {};
 
-  const files = Array.isArray(sessionFiles)
-    ? sessionFiles
-    : resolveClineSessionFiles(env || process.env);
+  let files;
+  let discoveredRoots = null;
+  if (Array.isArray(sessionFiles)) {
+    files = sessionFiles;
+  } else {
+    const scan = resolveClineSessionFilesWithStatus(env || process.env);
+    files = scan.files;
+    discoveredRoots = scan.completedRoots;
+  }
   // Only files with old offsets were counted before teammate support. Migrate
   // them before the unchanged-file gate, including the old renamed-root fallback.
   const legacyFilesBySession = new Map();
@@ -11880,8 +11921,19 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
   delete clineState.messageTotals;
 
   const activeFilePaths = new Set(files.map((entry) => entry.filePath));
+  const completedRoots = Array.isArray(scanCompleteRoots)
+    ? new Set(scanCompleteRoots)
+    : discoveredRoots
+      ? new Set(discoveredRoots)
+      : null;
   for (const filePath of new Set([...Object.keys(fileOffsets), ...Object.keys(messageTotalsByFile)])) {
     if (activeFilePaths.has(filePath)) continue;
+    if (
+      completedRoots &&
+      !completedRoots.has(path.dirname(path.dirname(filePath)))
+    ) {
+      continue;
+    }
     try {
       // A failed directory scan must not discard dedup state for existing files.
       fssync.statSync(filePath);
@@ -11987,14 +12039,14 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
         recordsProcessed++;
 
         const key = clineMessageKey(msg, msgIdx);
-        const legacyKey =
-          typeof msg.id === "string" && msg.id.trim()
-            ? null
-            : `ts:${Number.isFinite(ts) ? ts : 0}`;
-        const previous = messageTotals[key] ?? (legacyKey ? messageTotals[legacyKey] : undefined);
-        if (legacyKey && messageTotals[legacyKey] !== undefined) {
-          messageTotals[key] = previous;
-          delete messageTotals[legacyKey];
+        const timestampKey = `ts:${Number.isFinite(ts) ? ts : 0}:${msgIdx}`;
+        const legacyTimestampKey = `ts:${Number.isFinite(ts) ? ts : 0}`;
+        const previous =
+          messageTotals[key] ?? messageTotals[timestampKey] ?? messageTotals[legacyTimestampKey];
+        if (previous !== undefined) {
+          if (messageTotals[key] === undefined) messageTotals[key] = previous;
+          if (key !== timestampKey) delete messageTotals[timestampKey];
+          if (key !== legacyTimestampKey) delete messageTotals[legacyTimestampKey];
         }
         // A turn with no usage yet is left unrecorded so a later sync counts it
         // in full rather than latching the placeholder.
@@ -23560,6 +23612,7 @@ module.exports = {
   resolveClineSessionsDirs,
   listClineSessionFiles,
   resolveClineSessionFiles,
+  resolveClineSessionFilesWithStatus,
   readClineSessionModel,
   normalizeClineModel,
   parseClineIncremental,

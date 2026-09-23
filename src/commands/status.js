@@ -75,7 +75,7 @@ const {
   resolveReasonixTelemetryFiles,
   resolveKilocodeTaskFiles,
   resolveRoocodeTaskFiles,
-  resolveClineSessionFiles,
+  resolveClineSessionFilesWithStatus,
   resolveZedDbPath,
   resolveLmstudioHome,
   resolveLmstudioLogFiles,
@@ -697,8 +697,17 @@ async function cmdStatus(argv = []) {
   // Cline CLI v3 / desktop app — passive scan of
   // <home>/data/sessions/*/<session>.messages.json (Cline's own data dir, not
   // the VS Code globalStorage the Roo/Kilo forks still use).
-  const clineSessionFiles = resolveClineSessionFiles(process.env);
+  const clineScan = resolveClineSessionFilesWithStatus(process.env);
+  const clineSessionFiles = clineScan.files;
   const clineInstalled = clineSessionFiles.length > 0;
+  const clineSessionsDirCount = new Set(
+    clineSessionFiles.map((file) => path.dirname(path.dirname(file.filePath))),
+  ).size;
+  const clineDiscoveryError = clineScan.errors.length > 0
+    ? clineScan.errors
+      .map(({ root, error }) => `${root}: ${error.code ? `${error.code}: ` : ""}${error.message}`)
+      .join("; ")
+    : null;
 
   // Zed Agent — passive read of threads.db across all model providers
   // (hosted "zed.dev" and bring-your-own alike). threadTotals tracks one entry
@@ -1059,8 +1068,14 @@ async function cmdStatus(argv = []) {
           ? { installed: true, files: roocodeTaskFiles.length }
           : { installed: false },
         cline: clineInstalled
-          ? { installed: true, files: clineSessionFiles.length }
-          : { installed: false },
+          ? {
+              installed: true,
+              files: clineSessionFiles.length,
+              ...(clineDiscoveryError ? { error: clineDiscoveryError } : {}),
+            }
+          : clineDiscoveryError
+            ? { installed: false, error: clineDiscoveryError }
+            : { installed: false },
         zed: zedInstalled ? { installed: true, detail: zedDbPath } : { installed: false },
         goose: gooseInstalled
           ? { installed: true, detail: gooseDbPath }
@@ -1256,8 +1271,10 @@ async function cmdStatus(argv = []) {
         ? `- Roo Code (VS Code extension): passive reader (${roocodeTaskFiles.length} task${roocodeTaskFiles.length !== 1 ? "s" : ""} across ${new Set(roocodeTaskFiles.map((t) => t.ide)).size} IDE${new Set(roocodeTaskFiles.map((t) => t.ide)).size !== 1 ? "s" : ""})`
         : null,
       clineInstalled
-        ? `- Cline: passive reader (${clineSessionFiles.length} session${clineSessionFiles.length !== 1 ? "s" : ""} in ${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size} sessions dir${new Set(clineSessionFiles.map((f) => path.dirname(path.dirname(f.filePath)))).size !== 1 ? "s" : ""})`
-        : null,
+        ? `- Cline: passive reader (${clineSessionFiles.length} transcript${clineSessionFiles.length !== 1 ? "s" : ""} in ${clineSessionsDirCount} sessions dir${clineSessionsDirCount !== 1 ? "s" : ""})${clineDiscoveryError ? `; discovery failed (${clineDiscoveryError})` : ""}`
+        : clineDiscoveryError
+          ? `- Cline: discovery failed (${clineDiscoveryError})`
+          : null,
       zedInstalled
         ? `- Zed Agent: passive reader (threads.db, all providers${
             zedThreadsCounted > 0
@@ -1486,6 +1503,7 @@ function renderLightTable(summary) {
     if (typeof info.installed === "boolean") detail.push(info.installed ? "installed" : "not installed");
     if (typeof info.files === "number") detail.push(`${info.files} file${info.files !== 1 ? "s" : ""}`);
     if (info.detail) detail.push(info.detail);
+    if (info.error) detail.push(info.error);
     if (Array.isArray(info.wsl_distros) && info.wsl_distros.length) {
       detail.push(`WSL: ${info.wsl_distros.map((d) => `${d.name} (v${d.version ?? "?"})`).join(", ")}`);
     }
