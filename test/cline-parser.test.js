@@ -160,19 +160,68 @@ test("resolveClineSessionsDirs does not probe WSL when a path override is set", 
   assert.deepEqual(unioned, ["\\\\wsl$\\Ubuntu\\.cline\\data\\sessions"]);
 });
 
-test("resolveClineSessionFiles finds canonical transcripts and never doubles a session", () => {
+test("resolveClineSessionFiles finds root and teammate transcripts", () => {
   const home = setupFixture({
     sessions: [{ id: "session_1_aaa", model: "claude-sonnet-5", messages: [] }],
-    // A stray extra transcript in the same session dir (export / copy) must not
-    // become a second source for the same session.
-    extraFiles: { "session_1_aaa/backup.messages.json": JSON.stringify({ messages: [] }) },
+    extraFiles: { "session_1_aaa/teammate_1.messages.json": JSON.stringify({ messages: [] }) },
   });
   const files = resolveClineSessionFiles(fakeEnv(home));
-  assert.equal(files.length, 1);
-  assert.equal(files[0].sessionId, "session_1_aaa");
-  assert.match(files[0].filePath, /session_1_aaa\.messages\.json$/);
-  assert.match(files[0].sessionMetaPath, /session_1_aaa\.json$/);
+  assert.equal(files.length, 2);
+  assert.deepEqual(
+    files.map((file) => path.basename(file.filePath)).sort(),
+    ["session_1_aaa.messages.json", "teammate_1.messages.json"],
+  );
+  assert.ok(files.every((file) => file.sessionId === "session_1_aaa"));
+  assert.ok(files.some((file) => /session_1_aaa\.json$/.test(file.sessionMetaPath)));
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("parseClineIncremental includes teammate transcript usage", async () => {
+  const ts = Date.UTC(2026, 8, 19, 16, 30, 0);
+  const home = setupFixture({
+    sessions: [{
+      id: "session_team",
+      model: "claude-sonnet-5",
+      messages: [{
+        id: "root-turn",
+        role: "assistant",
+        ts,
+        modelInfo: { id: "claude-sonnet-5" },
+        metrics: { inputTokens: 100, outputTokens: 10 },
+      }],
+    }],
+    extraFiles: {
+      "session_team/teammate_1.messages.json": JSON.stringify({
+        messages: [{
+          id: "teammate-turn",
+          role: "assistant",
+          ts,
+          modelInfo: { id: "claude-sonnet-5" },
+          metrics: { inputTokens: 200, outputTokens: 20 },
+        }],
+      }),
+    },
+  });
+  try {
+    const queuePath = path.join(home, "queue.jsonl");
+    const cursors = {};
+    const result = await parseClineIncremental({
+      sessionFiles: resolveClineSessionFiles(fakeEnv(home)),
+      cursors,
+      queuePath,
+    });
+    assert.equal(result.eventsAggregated, 2);
+    const rows = queueRows(queuePath);
+    const row = lastRowForKey(rows, {
+      model: "claude-sonnet-5",
+      hourStart: "2026-09-19T16:30:00.000Z",
+    });
+    assert.equal(row.input_tokens, 300);
+    assert.equal(row.output_tokens, 30);
+    assert.equal(row.conversation_count, 2);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("listClineSessionFiles falls back to the first sorted transcript and skips empty dirs", () => {
@@ -393,7 +442,7 @@ test("parseClineIncremental adds only the increase when Cline back-fills a count
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("Cline retains a recently backfilled turn when the message ledger reaches its cap", async () => {
+test("Cline keeps per-file ledgers complete and prunes deleted transcripts", async () => {
   const home = setupFixture({ sessions: [] });
   try {
     const sessionId = "fixture-cap";
@@ -406,15 +455,19 @@ test("Cline retains a recently backfilled turn when the message ledger reaches i
     const files = resolveClineSessionFiles(fakeEnv(home));
     let cursors = {};
     await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
-    // Synthetic retained records fill the ledger; the real parsed turn is its oldest key.
-    for (let i = 0; i < 49_999; i++) {
-      cursors.cline.messageTotals[`fixture-retained:${i}`] = { input: 1 };
-    }
+    const fileKey = `${sessionId}:${sessionId}`;
+    cursors.cline.messageTotalsByFile ||= {};
+    Object.assign(
+      cursors.cline.messageTotalsByFile[fileKey],
+      Object.fromEntries(
+        Array.from({ length: 50_001 }, (_, i) => [`synthetic-${i}`, { input: 1 }]),
+      ),
+    );
     writeMessages(home, sessionId, [message("old", 200), message("new", 50)]);
     await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
-    assert.equal(Object.keys(cursors.cline.messageTotals).length, 50_000);
-    assert.equal(cursors.cline.messageTotals[`${sessionId}:old`]?.input, 200);
-    assert.equal(cursors.cline.messageTotals["fixture-retained:0"], undefined);
+    assert.equal(Object.keys(cursors.cline.messageTotalsByFile[fileKey]).length, 50_003);
+    assert.equal(cursors.cline.messageTotalsByFile[fileKey].old?.input, 200);
+    assert.equal(cursors.cline.messageTotalsByFile[fileKey]["synthetic-0"]?.input, 1);
 
     cursors = JSON.parse(JSON.stringify(cursors));
     writeMessages(home, sessionId, [message("old", 200), message("new", 50), message("next", 30)]);
@@ -423,6 +476,15 @@ test("Cline retains a recently backfilled turn when the message ledger reaches i
     const row = queueRows(queuePath).at(-1);
     assert.equal(row.total_tokens, 310);
     assert.equal(row.conversation_count, 3);
+
+    fs.rmSync(path.join(home, "data", "sessions", sessionId), { recursive: true, force: true });
+    await parseClineIncremental({
+      sessionFiles: resolveClineSessionFiles(fakeEnv(home)),
+      cursors,
+      queuePath,
+    });
+    assert.equal(cursors.cline.messageTotalsByFile[fileKey], undefined);
+    assert.equal(cursors.cline.fileOffsets[files[0].filePath], undefined);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -11539,12 +11539,12 @@ async function parseRoocodeIncremental({
 // final. We still keep last-emitted totals per message and emit the positive
 // difference: re-reading an unchanged file emits nothing, and if Cline ever
 // back-fills a larger total onto a message we already counted, only the
-// increase is added. The cap below mirrors the Roo/Kilo `seenIds` bound; the
-// per-file mtime gate is what keeps the common re-read free.
+// increase is added. The per-file mtime gate keeps the common re-read free.
+// Ledgers are kept per transcript so a deleted teammate file can be pruned
+// without affecting the rest of the session history.
 // ────────────────────────────────────────────────────────────────────────────
 
 const CLINE_MESSAGES_SUFFIX = ".messages.json";
-const MAX_CLINE_MESSAGE_TOTALS = 50_000;
 
 // Cline's own resolution chain, each step overridable ahead of it so a snapshot
 // can be pinned without touching the tool's environment:
@@ -11627,18 +11627,15 @@ function listClineSessionFiles(sessionsDir) {
     }
     const transcripts = artifacts.filter((name) => name.endsWith(CLINE_MESSAGES_SUFFIX)).sort();
     if (transcripts.length === 0) continue;
-    // The canonical transcript mirrors the session dir name
-    // (`<session_id>.messages.json`). An extra file in the same dir (an export,
-    // a renamed copy) would otherwise double-count the session, so prefer the
-    // canonical name and fall back to the first sorted one.
-    const canonical = `${entry.name}${CLINE_MESSAGES_SUFFIX}`;
-    const messagesName = transcripts.includes(canonical) ? canonical : transcripts[0];
     const metaName = `${entry.name}.json`;
-    out.push({
-      filePath: path.join(sessionDir, messagesName),
-      sessionMetaPath: artifacts.includes(metaName) ? path.join(sessionDir, metaName) : null,
-      sessionId: entry.name,
-    });
+    for (const messagesName of transcripts) {
+      out.push({
+        filePath: path.join(sessionDir, messagesName),
+        fileStem: messagesName.slice(0, -CLINE_MESSAGES_SUFFIX.length),
+        sessionMetaPath: artifacts.includes(metaName) ? path.join(sessionDir, metaName) : null,
+        sessionId: entry.name,
+      });
+    }
   }
   return out;
 }
@@ -11688,19 +11685,40 @@ function normalizeClineModel({ modelInfo, fallbackModel }) {
   return provider ? `provider:${provider}` : DEFAULT_MODEL;
 }
 
-function clineMessageTotalsKey(sessionId, message, index) {
+function clineMessageKey(message, index) {
   const id = message && typeof message.id === "string" ? message.id.trim() : "";
   // `id` is stable across in-place rewrites; ts is the fallback for a turn that
   // has not been assigned one.
-  return `${sessionId}:${id || `ts:${Number(message?.ts) || index}`}`;
+  return id || `ts:${Number(message?.ts) || index}`;
+}
+
+function clineTranscriptKey(entry, sessionId, filePath) {
+  const fileStem =
+    typeof entry.fileStem === "string" && entry.fileStem
+      ? entry.fileStem
+      : path.basename(filePath, CLINE_MESSAGES_SUFFIX);
+  return `${sessionId}:${fileStem}`;
+}
+
+function clineLegacyMessageTotalsKey(sessionId, message, index) {
+  return `${sessionId}:${clineMessageKey(message, index)}`;
 }
 
 async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgress, env } = {}) {
   await ensureDir(path.dirname(queuePath));
   const clineState = cursors.cline && typeof cursors.cline === "object" ? cursors.cline : {};
-  const messageTotals =
+  const legacyMessageTotals =
     clineState.messageTotals && typeof clineState.messageTotals === "object"
       ? { ...clineState.messageTotals }
+      : {};
+  const messageTotalsByFile =
+    clineState.messageTotalsByFile && typeof clineState.messageTotalsByFile === "object"
+      ? Object.fromEntries(
+          Object.entries(clineState.messageTotalsByFile).map(([key, value]) => [
+            key,
+            value && typeof value === "object" ? { ...value } : {},
+          ]),
+        )
       : {};
   const fileOffsets =
     clineState.fileOffsets && typeof clineState.fileOffsets === "object"
@@ -11710,11 +11728,25 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
   const files = Array.isArray(sessionFiles)
     ? sessionFiles
     : resolveClineSessionFiles(env || process.env);
+  const activeFilePaths = new Set(files.map((entry) => entry.filePath));
+  const activeFileKeys = new Set(
+    files.map((entry) => {
+      const filePath = entry.filePath;
+      const sessionId = entry.sessionId || path.basename(path.dirname(filePath));
+      return clineTranscriptKey(entry, sessionId, filePath);
+    }),
+  );
+  for (const filePath of Object.keys(fileOffsets)) {
+    if (!activeFilePaths.has(filePath)) delete fileOffsets[filePath];
+  }
+  for (const fileKey of Object.keys(messageTotalsByFile)) {
+    if (!activeFileKeys.has(fileKey)) delete messageTotalsByFile[fileKey];
+  }
 
   if (files.length === 0) {
     cursors.cline = {
       ...clineState,
-      messageTotals,
+      messageTotalsByFile,
       fileOffsets,
       updatedAt: new Date().toISOString(),
     };
@@ -11731,6 +11763,20 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
     const entry = files[fileIdx];
     const { filePath } = entry;
     const sessionId = entry.sessionId || path.basename(path.dirname(filePath));
+    const fileKey = clineTranscriptKey(entry, sessionId, filePath);
+    const messageTotals = messageTotalsByFile[fileKey] || {};
+    messageTotalsByFile[fileKey] = messageTotals;
+    // Migrate the old flat ledger for canonical transcripts. Teammate files
+    // did not participate in the old parser, so they have no legacy entries.
+    if ((entry.fileStem || path.basename(filePath, CLINE_MESSAGES_SUFFIX)) === sessionId) {
+      const legacyPrefix = `${sessionId}:`;
+      for (const [legacyKey, totals] of Object.entries(legacyMessageTotals)) {
+        if (legacyKey.startsWith(legacyPrefix)) {
+          const messageKey = legacyKey.slice(legacyPrefix.length);
+          if (messageTotals[messageKey] === undefined) messageTotals[messageKey] = totals;
+        }
+      }
+    }
     try {
       let stat;
       let raw;
@@ -11796,8 +11842,9 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
 
         recordsProcessed++;
 
-        const key = clineMessageTotalsKey(sessionId, msg, msgIdx);
-        const previous = messageTotals[key];
+        const key = clineMessageKey(msg, msgIdx);
+        const previous =
+          messageTotals[key] ?? legacyMessageTotals[clineLegacyMessageTotalsKey(sessionId, msg, msgIdx)];
         // A turn with no usage yet is left unrecorded so a later sync counts it
         // in full rather than latching the placeholder.
         if (totalTokens === 0 && reasoningTokens === 0 && cost === 0) continue;
@@ -11828,7 +11875,7 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
         });
         touchedBuckets.add(bucketKey("cline", model, bucketStart));
 
-        // Refresh update order so backfilled turns survive bounded eviction.
+        // Refresh update order so backfilled turns remain easy to inspect.
         delete messageTotals[key];
         messageTotals[key] = {
           input: inputTokens,
@@ -11864,21 +11911,11 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
     }
   }
 
-  // Keep the most recently updated message totals. Rewriting a transcript
-  // whose entries were already evicted can still re-count those older turns.
-  const totalsKeys = Object.keys(messageTotals);
-  const cappedTotals = {};
-  const keptKeys =
-    totalsKeys.length > MAX_CLINE_MESSAGE_TOTALS
-      ? totalsKeys.slice(-MAX_CLINE_MESSAGE_TOTALS)
-      : totalsKeys;
-  for (const key of keptKeys) cappedTotals[key] = messageTotals[key];
-
   const bucketsQueued = await enqueueTouchedBuckets({ queuePath, hourlyState, touchedBuckets });
   const updatedAt = new Date().toISOString();
   hourlyState.updatedAt = updatedAt;
   cursors.hourly = hourlyState;
-  cursors.cline = { ...clineState, messageTotals: cappedTotals, fileOffsets, updatedAt };
+  cursors.cline = { ...clineState, messageTotalsByFile, fileOffsets, updatedAt };
 
   return { recordsProcessed, eventsAggregated, bucketsQueued };
 }
