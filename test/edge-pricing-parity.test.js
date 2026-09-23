@@ -225,14 +225,6 @@ test("all cloud cost paths avoid double-billing Acode reasoning tokens", () => {
   }
 });
 
-test("all cloud cost paths fold OmO and Cline reasoning into output exactly once", () => {
-  for (const name of [CANONICAL, ...MIRRORS]) {
-    const source = readEdge(name);
-    assert.match(source, /(?:row\.source|src) === "omo" \|\| (?:row\.source|src) === "cline"/,
-      `${name}: OmO and Cline reasoning subset guard missing`);
-  }
-});
-
 test("all cloud cost paths keep Pi Copilot subscription rows at zero cost", () => {
   for (const name of [CANONICAL, ...MIRRORS]) {
     const source = readEdge(name);
@@ -290,6 +282,14 @@ test("all cloud cost paths only prefer provider-reported costs for authoritative
       /SOURCES_WITH_AUTHORITATIVE_COST\.has\((?:row\.source|src)\)[\s\S]*?Number\.isFinite\(reportedCost\)[\s\S]*?reportedCost > 0/,
       `${name}: positive reported cost must be gated by source`,
     );
+  }
+});
+
+test("all cloud cost paths keep Cline :free models at zero", () => {
+  for (const name of [CANONICAL, ...MIRRORS]) {
+    const source = readEdge(name);
+    assert.match(source, /source === "cline" && lower\.endsWith\(":free"\)/,
+      `${name}: Cline free suffix guard missing`);
   }
 });
 

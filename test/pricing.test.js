@@ -1194,6 +1194,18 @@ test("index: Cline reported cost is authoritative and reasoning is a subset", ()
   );
 });
 
+test("index: Cline free-suffixed models remain zero-cost", () => {
+  assert.equal(pricing.computeRowCost({
+    source: "cline",
+    model: "deepseek/deepseek-r1:free",
+    input_tokens: 1_000_000,
+    output_tokens: 1_000_000,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    reasoning_output_tokens: 0,
+  }), 0);
+});
+
 test("index: computeRowCost ignores reported costs from non-authoritative sources", () => {
   const row = {
     source: "command-code",

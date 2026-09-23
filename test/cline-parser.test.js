@@ -193,7 +193,7 @@ test("parseClineIncremental includes teammate transcript usage", async () => {
     extraFiles: {
       "session_team/teammate_1.messages.json": JSON.stringify({
         messages: [{
-          id: "teammate-turn",
+          id: "root-turn",
           role: "assistant",
           ts,
           modelInfo: { id: "claude-sonnet-5" },
@@ -219,6 +219,12 @@ test("parseClineIncremental includes teammate transcript usage", async () => {
     assert.equal(row.input_tokens, 300);
     assert.equal(row.output_tokens, 30);
     assert.equal(row.conversation_count, 2);
+    const second = await parseClineIncremental({
+      sessionFiles: resolveClineSessionFiles(fakeEnv(home)),
+      cursors: JSON.parse(JSON.stringify(cursors)),
+      queuePath,
+    });
+    assert.equal(second.eventsAggregated, 0);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -442,7 +448,7 @@ test("parseClineIncremental adds only the increase when Cline back-fills a count
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("Cline keeps per-file ledgers complete and prunes deleted transcripts", async () => {
+test("Cline resumes old sessions beyond 50,000 retained turns without replaying usage", async () => {
   const home = setupFixture({ sessions: [] });
   try {
     const sessionId = "fixture-cap";
@@ -455,27 +461,25 @@ test("Cline keeps per-file ledgers complete and prunes deleted transcripts", asy
     const files = resolveClineSessionFiles(fakeEnv(home));
     let cursors = {};
     await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
-    const fileKey = `${sessionId}:${sessionId}`;
-    cursors.cline.messageTotalsByFile ||= {};
-    Object.assign(
-      cursors.cline.messageTotalsByFile[fileKey],
-      Object.fromEntries(
-        Array.from({ length: 50_001 }, (_, i) => [`synthetic-${i}`, { input: 1 }]),
-      ),
-    );
+    // Synthetic newer sessions exceed the old global eviction threshold.
+    writeMessages(home, "fixture-newer", Array.from({ length: 50_001 }, (_, i) => message(`turn-${i}`, 1)));
+    const allFiles = () => resolveClineSessionFiles(fakeEnv(home));
+    await parseClineIncremental({ sessionFiles: allFiles(), cursors, queuePath });
+    const before = queueRows(queuePath).at(-1);
+    cursors = JSON.parse(JSON.stringify(cursors));
     writeMessages(home, sessionId, [message("old", 200), message("new", 50)]);
-    await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
-    assert.equal(Object.keys(cursors.cline.messageTotalsByFile[fileKey]).length, 50_003);
-    assert.equal(cursors.cline.messageTotalsByFile[fileKey].old?.input, 200);
-    assert.equal(cursors.cline.messageTotalsByFile[fileKey]["synthetic-0"]?.input, 1);
+    await parseClineIncremental({ sessionFiles: allFiles(), cursors, queuePath });
+    const grown = queueRows(queuePath).at(-1);
+    assert.equal(grown.total_tokens - before.total_tokens, 160);
+    assert.equal(grown.conversation_count - before.conversation_count, 1);
 
     cursors = JSON.parse(JSON.stringify(cursors));
     writeMessages(home, sessionId, [message("old", 200), message("new", 50), message("next", 30)]);
-    const result = await parseClineIncremental({ sessionFiles: files, cursors, queuePath });
+    const result = await parseClineIncremental({ sessionFiles: allFiles(), cursors, queuePath });
     assert.equal(result.eventsAggregated, 1);
     const row = queueRows(queuePath).at(-1);
-    assert.equal(row.total_tokens, 310);
-    assert.equal(row.conversation_count, 3);
+    assert.equal(row.total_tokens - before.total_tokens, 200);
+    assert.equal(row.conversation_count - before.conversation_count, 2);
 
     fs.rmSync(path.join(home, "data", "sessions", sessionId), { recursive: true, force: true });
     await parseClineIncremental({
@@ -483,8 +487,69 @@ test("Cline keeps per-file ledgers complete and prunes deleted transcripts", asy
       cursors,
       queuePath,
     });
-    assert.equal(cursors.cline.messageTotalsByFile[fileKey], undefined);
+    assert.equal(cursors.cline.messageTotalsByFile[files[0].filePath], undefined);
     assert.equal(cursors.cline.fileOffsets[files[0].filePath], undefined);
+    assert.equal(Object.keys(cursors.cline.messageTotalsByFile).length, 1);
+    fs.rmSync(path.join(home, "data", "sessions", "fixture-newer"), { recursive: true });
+    await parseClineIncremental({ sessionFiles: allFiles(), cursors, queuePath });
+    assert.deepEqual(cursors.cline.messageTotalsByFile, {});
+    assert.deepEqual(cursors.cline.fileOffsets, {});
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Cline migrates only previously read transcripts and discards the flat ledger", async (t) => {
+  for (const stem of ["fixture-legacy", "renamed-root"]) {
+    await t.test(stem, async () => {
+      const sessionId = "fixture-legacy";
+      const ts = Date.UTC(2026, 8, 19, 18, 40);
+      const msg = { id: "shared-id", role: "assistant", ts, metrics: { inputTokens: 100 } };
+      const home = setupFixture({ sessions: [{ id: sessionId, messages: [msg] }] });
+      try {
+        const sessionDir = path.join(home, "data", "sessions", sessionId);
+        const rootPath = path.join(sessionDir, `${stem}.messages.json`);
+        if (stem !== sessionId) {
+          fs.renameSync(path.join(sessionDir, `${sessionId}.messages.json`), rootPath);
+        }
+        const queuePath = path.join(home, "queue.jsonl");
+        let cursors = {};
+        const files = () => resolveClineSessionFiles(fakeEnv(home));
+        await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+        // Cursor shape written by the previous PR revision, with an unchanged file offset.
+        delete cursors.cline.messageTotalsByFile;
+        cursors.cline.messageTotals = { [`${sessionId}:shared-id`]: { input: 100 } };
+        fs.writeFileSync(path.join(sessionDir, "teammate.messages.json"), JSON.stringify({ messages: [msg] }));
+        const migrated = await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+        assert.equal(migrated.eventsAggregated, 1, "new teammate must not inherit root totals");
+        assert.equal(queueRows(queuePath).at(-1).total_tokens, 200);
+        assert.equal(cursors.cline.messageTotals, undefined, "do not persist two ledgers");
+        cursors = JSON.parse(JSON.stringify(cursors));
+        fs.writeFileSync(rootPath, JSON.stringify({ messages: [msg], updated_at: ts }));
+        const resumed = await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+        assert.equal(resumed.eventsAggregated, 0, "unchanged legacy totals survive a later rewrite");
+      } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Cline retains cursors when discovery temporarily omits an existing transcript", async () => {
+  const home = setupFixture({ sessions: [{
+    id: "fixture-omitted", messages: [{
+      id: "turn", role: "assistant", ts: Date.UTC(2026, 8, 19), metrics: { inputTokens: 100 },
+    }],
+  }] });
+  try {
+    const queuePath = path.join(home, "queue.jsonl");
+    const cursors = {};
+    const sessionFiles = resolveClineSessionFiles(fakeEnv(home));
+    await parseClineIncremental({ sessionFiles, cursors, queuePath });
+    await parseClineIncremental({ sessionFiles: [], cursors, queuePath });
+    const resumed = await parseClineIncremental({ sessionFiles, cursors, queuePath });
+    assert.equal(resumed.eventsAggregated, 0);
+    assert.equal(queueRows(queuePath).length, 1);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

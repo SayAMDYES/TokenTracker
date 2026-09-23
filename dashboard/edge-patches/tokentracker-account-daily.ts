@@ -403,6 +403,7 @@ function getModelPricing(model: string, source = "") {
   const exact = MODEL_PRICING[model];
   if (exact) return exact;
   const lower = model.toLowerCase();
+  if (source === "cline" && lower.endsWith(":free")) return ZERO_PRICING;
   // Cline's own gateway namespaces (`cline-free/*` free tier, `cline-pass/*`
   // flat-rate Cline Pass) bill nothing per token, and the model id after the
   // slash must not inherit a public rate — cline-pass/glm-5.3 is not GLM-5.3
@@ -683,7 +684,7 @@ function computeRowCost(row: GroupedRow): number {
   // tokentracker-leaderboard-refresh.ts (both guard on source).
   const reasoningCost =
     row.source === "codex" || row.source === "acode" || row.source === "every-code" ||
-      row.source === "omo" || row.source === "cline"
+      row.source === "cline"
       ? 0
       : (Number(row.reasoning_output_tokens) || 0) * (p.output || 0);
   return (
