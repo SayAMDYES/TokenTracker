@@ -287,9 +287,15 @@ test("all cloud cost paths only prefer provider-reported costs for authoritative
 
 test("all cloud cost paths keep Cline :free models at zero", () => {
   for (const name of [CANONICAL, ...MIRRORS]) {
-    const source = readEdge(name);
-    assert.match(source, /source === "cline" && lower\.endsWith\(":free"\)/,
-      `${name}: Cline free suffix guard missing`);
+    const { code } = transformSync(extractBlock(name), { loader: "ts", target: "es2020" });
+    const getModelPricing = vm.runInNewContext(`${code}\ngetModelPricing;`);
+    for (const model of ["deepseek/deepseek-r1:free", "cline-free/deepseek-v4.1-flash", "cline-pass/glm-5.3"]) {
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(getModelPricing(model, "cline"))),
+        { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+        `${name}: ${model}`,
+      );
+    }
   }
 });
 
