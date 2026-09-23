@@ -16,6 +16,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 
@@ -247,6 +248,69 @@ test("listClineSessionFiles falls back to the first sorted transcript and skips 
   assert.equal(listed[0].sessionMetaPath, null);
   assert.match(listed[0].filePath, /renamed\.messages\.json$/);
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("listClineSessionFiles propagates permission errors", (t) => {
+  t.mock.method(fs, "readdirSync", () => {
+    throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+  });
+  assert.throws(() => listClineSessionFiles("/tmp/cline-permission"), { code: "EACCES" });
+});
+
+test("Cline message fallback keys include the index when timestamps are equal", async () => {
+  const ts = Date.UTC(2026, 8, 19, 16, 30, 0);
+  const home = setupFixture({
+    sessions: [{
+      id: "session-key",
+      messages: [
+        { role: "assistant", ts, metrics: { inputTokens: 100, outputTokens: 1 } },
+        { role: "assistant", ts, metrics: { inputTokens: 200, outputTokens: 2 } },
+      ],
+    }],
+  });
+  try {
+    const cursors = {};
+    await parseClineIncremental({
+      sessionFiles: resolveClineSessionFiles(fakeEnv(home)),
+      cursors,
+      queuePath: path.join(home, "queue.jsonl"),
+    });
+    const ledger = Object.values(cursors.cline.messageTotalsByFile)[0];
+    assert.equal(Object.keys(ledger).length, 2);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Cline keeps cursor state unchanged when queue append fails", async (t) => {
+  const ts = Date.UTC(2026, 8, 19, 16, 30, 0);
+  const home = setupFixture({
+    sessions: [{
+      id: "session-atomic",
+      messages: [{ id: "turn", role: "assistant", ts, metrics: { inputTokens: 100, outputTokens: 1 } }],
+    }],
+  });
+  try {
+    const queuePath = path.join(home, "queue.jsonl");
+    const cursors = {};
+    const files = () => resolveClineSessionFiles(fakeEnv(home));
+    await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+    writeMessages(home, "session-atomic", [{
+      id: "turn", role: "assistant", ts, metrics: { inputTokens: 200, outputTokens: 2 },
+    }]);
+    const before = JSON.parse(JSON.stringify(cursors));
+    t.mock.method(fsp, "appendFile", async () => {
+      throw Object.assign(new Error("queue unavailable"), { code: "EIO" });
+    });
+    await assert.rejects(
+      parseClineIncremental({ sessionFiles: files(), cursors, queuePath }),
+      { code: "EIO" },
+    );
+    assert.deepEqual(cursors, before);
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("normalizeClineModel falls back: modelInfo.id > session model > provider", () => {

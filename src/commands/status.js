@@ -1058,6 +1058,9 @@ async function cmdStatus(argv = []) {
         roocode: roocodeInstalled
           ? { installed: true, files: roocodeTaskFiles.length }
           : { installed: false },
+        cline: clineInstalled
+          ? { installed: true, files: clineSessionFiles.length }
+          : { installed: false },
         zed: zedInstalled ? { installed: true, detail: zedDbPath } : { installed: false },
         goose: gooseInstalled
           ? { installed: true, detail: gooseDbPath }
