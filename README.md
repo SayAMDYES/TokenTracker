@@ -370,7 +370,7 @@ Most users never need this — defaults are sensible. For advanced setups:
 | `TOKENTRACKER_LMSTUDIO_HOME` | Override the LM Studio data directory used by the passive server-log reader | `~/.lmstudio` |
 | `TOKENTRACKER_UNSLOTH_DB` | Override the Unsloth Studio database file used by the passive usage reader | `$UNSLOTH_STUDIO_HOME/studio.db` |
 | `TOKENTRACKER_DEVIN_DB` | Override the Devin CLI database file used by the passive usage reader | `$XDG_DATA_HOME/devin/cli/sessions.db` |
-| `TOKENTRACKER_MINIMAX_HOME` | Override the MiniMax Code session directory used by the passive usage reader | `~/.minimax` |
+| `TOKENTRACKER_MINIMAX_HOME` | Override the MiniMax Code data directory used by the passive usage reader | `~/.minimax` |
 
 ### 🐧 Windows Subsystem for Linux (WSL) Auto-Discovery
 

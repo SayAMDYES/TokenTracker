@@ -1896,15 +1896,15 @@ async function cmdSync(argv, context = {}) {
     }
 
     // ── Cline (CLI v3 / desktop app — ~/.cline/data/sessions) ──
-    const clineSessionFiles = sourceAllowed("cline") ? resolveClineSessionFiles(process.env) : [];
     let clineResult = { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
-    if (clineSessionFiles.length > 0) {
-      if (progress?.enabled) {
-        progress.start(
-          `Parsing Cline ${renderBar(0)} 0/${formatNumber(clineSessionFiles.length)} sessions | buckets 0`,
-        );
-      }
+    if (sourceAllowed("cline")) {
       try {
+        const clineSessionFiles = resolveClineSessionFiles(process.env);
+        if (progress?.enabled && clineSessionFiles.length > 0) {
+          progress.start(
+            `Parsing Cline ${renderBar(0)} 0/${formatNumber(clineSessionFiles.length)} transcripts | buckets 0`,
+          );
+        }
         clineResult = await parseClineIncremental({
           sessionFiles: clineSessionFiles,
           cursors,
@@ -1915,7 +1915,7 @@ async function cmdSync(argv, context = {}) {
             progress.update(
               `Parsing Cline ${renderBar(pct)} ${formatNumber(p.index)}/${formatNumber(
                 p.total,
-              )} sessions | buckets ${formatNumber(p.bucketsQueued)}`,
+              )} transcripts | buckets ${formatNumber(p.bucketsQueued)}`,
             );
           },
         });

@@ -257,6 +257,31 @@ test("listClineSessionFiles propagates permission errors", (t) => {
   assert.throws(() => listClineSessionFiles("/tmp/cline-permission"), { code: "EACCES" });
 });
 
+test("Cline discovery distinguishes missing paths from failed directory reads", async (t) => {
+  const home = setupFixture({ sessions: [{ id: "discovery", messages: [] }] });
+  const sessionsDir = path.join(home, "data", "sessions");
+  try {
+    for (const target of [sessionsDir, path.join(sessionsDir, "discovery")]) {
+      for (const code of ["ENOENT", "ENOTDIR", "EACCES", "EIO"]) {
+        await t.test(`${path.basename(target)} ${code}`, (t) => {
+          const read = fs.readdirSync;
+          t.mock.method(fs, "readdirSync", (dir, ...args) => {
+            if (dir === target) throw Object.assign(new Error("synthetic discovery failure"), { code });
+            return read(dir, ...args);
+          });
+          if (code === "ENOENT" || code === "ENOTDIR") {
+            assert.deepEqual(listClineSessionFiles(sessionsDir), []);
+          } else {
+            assert.throws(() => listClineSessionFiles(sessionsDir), { code });
+          }
+        });
+      }
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("Cline message fallback keys include the index when timestamps are equal", async () => {
   const ts = Date.UTC(2026, 8, 19, 16, 30, 0);
   const home = setupFixture({
@@ -275,8 +300,9 @@ test("Cline message fallback keys include the index when timestamps are equal", 
       cursors,
       queuePath: path.join(home, "queue.jsonl"),
     });
-    const ledger = Object.values(cursors.cline.messageTotalsByFile)[0];
-    assert.equal(Object.keys(ledger).length, 2);
+    const row = queueRows(path.join(home, "queue.jsonl")).at(-1);
+    assert.equal(row.total_tokens, 303);
+    assert.equal(row.conversation_count, 2);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
@@ -306,9 +332,37 @@ test("Cline keeps cursor state unchanged when queue append fails", async (t) => 
       parseClineIncremental({ sessionFiles: files(), cursors, queuePath }),
       { code: "EIO" },
     );
-    assert.deepEqual(cursors, before);
+    assert.deepEqual(JSON.parse(JSON.stringify(cursors)), before);
+    t.mock.restoreAll();
+    await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+    assert.equal(queueRows(queuePath).at(-1).total_tokens, 202);
+    assert.equal(queueRows(queuePath).at(-1).conversation_count, 1);
+    const idle = await parseClineIncremental({ sessionFiles: files(), cursors, queuePath });
+    assert.equal(idle.bucketsQueued, 0);
   } finally {
     t.mock.restoreAll();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Cline migrates timestamp-only keys even when usage has not grown", async () => {
+  const ts = Date.UTC(2026, 8, 19, 16, 30);
+  const messages = [{ role: "assistant", ts, metrics: { inputTokens: 100 } }];
+  const home = setupFixture({ sessions: [{ id: "key-migration", messages }] });
+  try {
+    const sessionFiles = resolveClineSessionFiles(fakeEnv(home));
+    const queuePath = path.join(home, "queue.jsonl");
+    let cursors = {};
+    await parseClineIncremental({ sessionFiles, cursors, queuePath });
+    cursors.cline.messageTotalsByFile[sessionFiles[0].filePath] = { [`ts:${ts}`]: { input: 100 } };
+    for (const padding of [" ", "  "]) {
+      fs.writeFileSync(sessionFiles[0].filePath, JSON.stringify({ messages }) + padding);
+      cursors = JSON.parse(JSON.stringify(cursors));
+      const result = await parseClineIncremental({ sessionFiles, cursors, queuePath });
+      assert.equal(result.eventsAggregated, 0);
+    }
+    assert.equal(queueRows(queuePath).at(-1).total_tokens, 100);
+  } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

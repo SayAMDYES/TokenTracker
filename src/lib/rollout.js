@@ -11844,21 +11844,6 @@ function clineMessageKey(message, index) {
   return id || `ts:${Number.isFinite(timestamp) ? timestamp : 0}:${index}`;
 }
 
-function cloneHourlyStateForParser(state) {
-  return {
-    ...state,
-    buckets: Object.fromEntries(
-      Object.entries(state.buckets || {}).map(([key, bucket]) => [
-        key,
-        bucket && typeof bucket === "object"
-          ? { ...bucket, totals: cloneTotals(bucket.totals) }
-          : bucket,
-      ]),
-    ),
-    groupQueued: { ...(state.groupQueued || {}) },
-  };
-}
-
 async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgress, env } = {}) {
   await ensureDir(path.dirname(queuePath));
   const clineState = cursors.cline && typeof cursors.cline === "object" ? { ...cursors.cline } : {};
@@ -11889,7 +11874,7 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
     const separator = legacyKey.indexOf(":");
     const filePath = legacyFilesBySession.get(legacyKey.slice(0, separator));
     if (!filePath || clineState.messageTotalsByFile?.[filePath]) continue;
-    const ledger = messageTotalsByFile[filePath] ||= {};
+    const ledger = messageTotalsByFile[filePath] ||= Object.create(null);
     ledger[legacyKey.slice(separator + 1)] = totals;
   }
   delete clineState.messageTotals;
@@ -11917,7 +11902,15 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
     return { recordsProcessed: 0, eventsAggregated: 0, bucketsQueued: 0 };
   }
 
-  const hourlyState = cloneHourlyStateForParser(normalizeHourlyState(cursors?.hourly));
+  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  // Enqueue also updates sibling buckets' alignment and queued keys. Isolate
+  // Cline buckets until the append succeeds, keeping other sources untouched.
+  for (const [key, bucket] of Object.entries(hourlyState.buckets)) {
+    if (parseBucketKey(key).source === "cline" && bucket) {
+      hourlyState.buckets[key] = { ...bucket, totals: { ...bucket.totals } };
+    }
+  }
+  hourlyState.groupQueued = { ...hourlyState.groupQueued };
   const touchedBuckets = new Set();
   const cb = typeof onProgress === "function" ? onProgress : null;
   let recordsProcessed = 0;
@@ -11964,7 +11957,7 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
           : null;
       if (!messages) continue;
 
-      const messageTotals = Object.assign({}, messageTotalsByFile[filePath]);
+      const messageTotals = Object.assign(Object.create(null), messageTotalsByFile[filePath]);
       messageTotalsByFile[filePath] = messageTotals;
       const fallbackModel = readClineSessionModel(entry.sessionMetaPath);
 
@@ -11999,7 +11992,10 @@ async function parseClineIncremental({ sessionFiles, cursors, queuePath, onProgr
             ? null
             : `ts:${Number.isFinite(ts) ? ts : 0}`;
         const previous = messageTotals[key] ?? (legacyKey ? messageTotals[legacyKey] : undefined);
-        if (legacyKey && messageTotals[legacyKey] !== undefined) delete messageTotals[legacyKey];
+        if (legacyKey && messageTotals[legacyKey] !== undefined) {
+          messageTotals[key] = previous;
+          delete messageTotals[legacyKey];
+        }
         // A turn with no usage yet is left unrecorded so a later sync counts it
         // in full rather than latching the placeholder.
         if (totalTokens === 0 && reasoningTokens === 0 && cost === 0) continue;
