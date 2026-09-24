@@ -232,10 +232,17 @@ final class StatusBarController: NSObject {
         }
         let islandEnabled = UserDefaults.standard.bool(forKey: DynamicIslandController.enabledDefaultsKey)
         // Never leave the user with zero UI: only hide menu bar icon if Dynamic Island is active.
+        let wasVisible = statusItem.isVisible
         statusItem.isVisible = MenuBarSurfacePolicy.isIconVisible(
             hideRequested: hideRequested,
             islandEnabled: islandEnabled
         )
+        animator?.updatesButton = statusItem.isVisible
+        // Frames skipped the button while hidden; catch it up so a paused
+        // animation (sleeping, reduced motion) doesn't show a stale icon.
+        if animator != nil, statusItem.isVisible, !wasVisible {
+            updateStatsDisplay()
+        }
     }
 
     private func observeApplicationActivity() {
@@ -267,9 +274,13 @@ final class StatusBarController: NSObject {
         updateMenuBarIconVisibility()
 
         animator = MenuBarAnimator(button: button)
+        animator?.updatesButton = statusItem.isVisible
         animator?.onImageUpdated = { [weak self] image in
             guard let self else { return }
-            if self.showStats, !self.buildMenuBarDisplayValues().isEmpty {
+            // Hidden status item (island-only setup): the composite is never
+            // seen, so skip rebuilding it every frame. `updateMenuBarIconVisibility`
+            // re-composites when the item comes back.
+            if self.statusItem.isVisible, self.showStats, !self.buildMenuBarDisplayValues().isEmpty {
                 self.updateStatsDisplay()
             }
             NotificationCenter.default.post(name: .menuBarIconFrameUpdated, object: image)
