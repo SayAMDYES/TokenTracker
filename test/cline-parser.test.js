@@ -41,10 +41,16 @@ function setupFixture({ sessions, extraFiles = {} }) {
       path.join(sessionDir, `${session.id}.messages.json`),
       JSON.stringify({ version: 1, sessionId: session.id, messages: session.messages }),
     );
-    if (session.model !== undefined) {
+    if (session.model !== undefined || session.importedFrom) {
+      const metadata = {
+        session_id: session.id,
+        provider: "cline",
+        ...(session.model === undefined ? {} : { model: session.model }),
+        ...(session.importedFrom ? { metadata: { importedFrom: session.importedFrom } } : {}),
+      };
       fs.writeFileSync(
         path.join(sessionDir, `${session.id}.json`),
-        JSON.stringify({ session_id: session.id, provider: "cline", model: session.model }),
+        JSON.stringify(metadata),
       );
     }
   }
@@ -176,6 +182,54 @@ test("resolveClineSessionFiles finds root and teammate transcripts", () => {
   assert.ok(files.every((file) => file.sessionId === "session_1_aaa"));
   assert.ok(files.some((file) => /session_1_aaa\.json$/.test(file.sessionMetaPath)));
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("parseClineIncremental skips usage copied from an imported source session", async () => {
+  const importedAt = Date.UTC(2026, 8, 19, 16, 30, 0);
+  const home = setupFixture({
+    sessions: [{
+      id: "imported-codex",
+      model: "gpt-5.4",
+      importedFrom: {
+        tool: "codex",
+        sourceSessionId: "codex-source",
+        sourcePath: "/tmp/codex-source.jsonl",
+        importedAt: new Date(importedAt).toISOString(),
+      },
+      messages: [
+        {
+          id: "copied-turn",
+          role: "assistant",
+          ts: importedAt - 1,
+          modelInfo: { id: "gpt-5.4" },
+          metrics: { inputTokens: 1_000, outputTokens: 100 },
+        },
+        {
+          id: "cline-turn",
+          role: "assistant",
+          ts: importedAt + 1,
+          modelInfo: { id: "gpt-5.4" },
+          metrics: { inputTokens: 200, outputTokens: 20 },
+        },
+      ],
+    }],
+  });
+  try {
+    const queuePath = path.join(home, "queue.jsonl");
+    const result = await parseClineIncremental({
+      sessionFiles: resolveClineSessionFiles(fakeEnv(home)),
+      cursors: {},
+      queuePath,
+    });
+    assert.equal(result.recordsProcessed, 1);
+    assert.equal(result.eventsAggregated, 1);
+    const row = queueRows(queuePath).find((candidate) => candidate.source === "cline");
+    assert.equal(row.input_tokens, 200);
+    assert.equal(row.output_tokens, 20);
+    assert.equal(row.conversation_count, 1);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("parseClineIncremental includes teammate transcript usage", async () => {

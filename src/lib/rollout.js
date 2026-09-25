@@ -11837,8 +11837,10 @@ function resolveClineSessionFilesWithStatus(env = process.env, deps = {}) {
 
 // The session sidecar names the model the session started on. It is only a
 // fallback: a turn's own `modelInfo.id` wins because Cline can switch models
-// mid-session.
-function readClineSessionModel(metaPath) {
+// mid-session. Imported sessions also retain the source transcript's usage;
+// the import timestamp lets us leave those already-counted turns to their
+// original provider parser.
+function readClineSessionMetadata(metaPath) {
   if (typeof metaPath !== "string" || !metaPath) return null;
   let parsed;
   try {
@@ -11847,7 +11849,13 @@ function readClineSessionModel(metaPath) {
     return null;
   }
   const model = parsed && typeof parsed.model === "string" ? parsed.model.trim() : "";
-  return model || null;
+  const importedAt = parsed?.metadata?.importedFrom?.importedAt;
+  const importedAtMs = typeof importedAt === "string" ? Date.parse(importedAt) : NaN;
+  return { model: model || null, importedAtMs: Number.isFinite(importedAtMs) ? importedAtMs : null };
+}
+
+function readClineSessionModel(metaPath) {
+  return readClineSessionMetadata(metaPath)?.model || null;
 }
 
 function normalizeClineModel({ modelInfo, fallbackModel }) {
@@ -12011,7 +12019,9 @@ async function parseClineIncremental({
 
       const messageTotals = Object.assign(Object.create(null), messageTotalsByFile[filePath]);
       messageTotalsByFile[filePath] = messageTotals;
-      const fallbackModel = readClineSessionModel(entry.sessionMetaPath);
+      const sessionMetadata = readClineSessionMetadata(entry.sessionMetaPath);
+      const fallbackModel = sessionMetadata?.model || null;
+      const importedAtMs = sessionMetadata?.importedAtMs ?? null;
 
       for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
         const msg = messages[msgIdx];
@@ -12022,6 +12032,7 @@ async function parseClineIncremental({
 
         const ts = Number(msg.ts);
         if (!Number.isFinite(ts) || ts <= 0) continue;
+        if (importedAtMs !== null && ts <= importedAtMs) continue;
 
         // Cline's `inputTokens` already contains both cache buckets, so only the
         // non-cached remainder is billable input. See the header comment.
